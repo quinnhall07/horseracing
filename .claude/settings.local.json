@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import pytest; print\\('pytest', pytest.__version__\\)\")",
+      "Bash(python -c \"import pydantic; print\\('pydantic', pydantic.__version__\\)\")",
+      "Bash(python -c \"import structlog; print\\('structlog', structlog.__version__\\)\")",
+      "Bash(python -c \"import pdfplumber; print\\('pdfplumber', pdfplumber.__version__\\)\")",
+      "Bash(python -m venv .venv)",
+      "Bash(.venv/Scripts/python.exe --version)",
+      "Bash(.venv/Scripts/python.exe -m pip --version)",
+      "Bash(.venv/Scripts/python.exe -m pip install --upgrade pip)",
+      "Bash(.venv/Scripts/python.exe -m pip install \"pydantic>=2.6\" \"pydantic-settings>=2.2\" \"structlog>=24.1\" \"pdfplumber>=0.11\" \"pypdf>=4.2\" \"pytest>=8.0\" \"reportlab>=4.0\")",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(git -C /c/Users/danie/Documents/GitHub/horseracing status --short)",
+      "Bash(git -C /c/Users/danie/Documents/GitHub/horseracing check-ignore -v .venv)",
+      "Bash(git -C /c/Users/danie/Documents/GitHub/horseracing config --get core.excludesfile)",
+      "Bash(git -C /c/Users/danie/Documents/GitHub/horseracing status)",
+      "Bash(git -C /c/Users/danie/Documents/GitHub/horseracing ls-files --others --exclude-standard --directory)"
+    ]
+  }
+}

@@ -1,0 +1,49 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ── Virtual environments ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── IDE / editor ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Project ─────────────────────────────────────────────────────────────────
+.env
+.env.local
+*.db
+*.sqlite
+*.sqlite3
+horseracing.db
+
+# ── Models / artifacts (large binaries — store via DVC / S3 instead) ────────
+*.pkl
+*.joblib
+*.pt
+*.pth
+*.onnx
+artifacts/
+data/raw/
+data/processed/
+data/interim/

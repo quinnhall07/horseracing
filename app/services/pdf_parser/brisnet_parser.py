@@ -78,9 +78,12 @@ _RE_TRACK_DATE = re.compile(
     re.VERBOSE,
 )
 
-# Distance line: "6 Furlongs", "1 1/16 Miles", "5½f", "About 1 Mile"
+# Distance line: "6 Furlongs", "1 1/16 Miles", "5½f", "About 1 Mile".
+# Fraction permits 1-2 digit numerator/denominator (covers 1/16, 3/16, etc.).
+# Leading whitespace before the fraction is optional so post-normalize "51/2f"
+# (the ½-ligature substitution output) still matches.
 _RE_DISTANCE = re.compile(
-    r"(?:About\s+)?(\d+\s*(?:\d/\d)?\s*(?:Furlongs?|Miles?|[fF]))",
+    r"(?:About\s+)?(\d+(?:\s*\d{1,2}/\d{1,2})?\s*(?:Furlongs?|Miles?|[fF]))",
     re.IGNORECASE,
 )
 
@@ -90,8 +93,12 @@ _RE_SURFACE_PAREN = re.compile(r"\((Dirt|Turf|Synthetic|All.Weather)\)", re.IGNO
 # Purse: "Purse: $35,000" or "Purse $35,000"
 _RE_PURSE = re.compile(r"Purse[:\s]+\$?([\d,]+)", re.IGNORECASE)
 
-# Claiming price: "For 3YO+ (Claiming $20,000)" or "Clm 15000"
-_RE_CLAIMING = re.compile(r"Clm(?:aiming)?[\s:$]+([\d,]+)", re.IGNORECASE)
+# Claiming price: "For 3YO+ (Claiming $20,000)" or "Clm 15000".
+# Match either spelling — "Claiming" doesn't actually start with "Clm" so the
+# alternation is required.
+_RE_CLAIMING = re.compile(
+    r"Cl(?:aiming|m)\b[\s:$]+\$?([\d,]+)", re.IGNORECASE
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Regex patterns for horse-level data
@@ -262,6 +269,8 @@ class BrisnetParser:
 
         warnings: list[str] = []
         header = self._parse_race_header(block.header_lines, block.race_num, warnings)
+        if header is None:
+            return None
         entries = self._parse_horse_entries(block.header_lines, warnings)
 
         # Confidence: proportion of entries with ≥ 1 PP line, weighted by header completeness
@@ -296,10 +305,14 @@ class BrisnetParser:
 
     def _parse_race_header(
         self, lines: list[str], race_num: int, warnings: list[str]
-    ) -> RaceHeader:
+    ) -> Optional[RaceHeader]:
         """
         Extract track code, date, distance, surface, condition, race type, purse,
         and claiming price from the first ~15 lines of a race block.
+
+        Returns None when distance cannot be extracted — distance is the one
+        truly load-bearing field for downstream feature engineering and the
+        schema enforces `ge=2.0`, so we degrade gracefully rather than crash.
         """
         header_text = "\n".join(lines[:20])
 
@@ -314,15 +327,20 @@ class BrisnetParser:
         else:
             warnings.append(f"Race {race_num}: could not extract track code / date")
 
-        # Distance
+        # Distance — load-bearing. If missing, abandon this race.
         distance_furlongs = 0.0
         distance_raw = ""
         m_dist = _RE_DISTANCE.search(header_text)
         if m_dist:
             distance_raw = m_dist.group(1).strip()
             distance_furlongs = parse_distance_to_furlongs(distance_raw) or 0.0
-        else:
-            warnings.append(f"Race {race_num}: could not extract distance")
+
+        if distance_furlongs < 2.0:
+            warnings.append(
+                f"Race {race_num}: could not extract a valid distance "
+                f"(raw='{distance_raw}'); skipping race"
+            )
+            return None
 
         # Surface
         surface_str = "unknown"

@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "horseracing"
+version = "0.1.0"
+description = "Pari-mutuel wagering analytics system — PDF ingestion, ensemble ML, CVaR portfolio optimization."
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "Proprietary" }
+
+# Runtime dependencies for the PDF ingestion pipeline (Phase 1).
+# Heavier ML deps (lightgbm, torch, scipy) are added in later phases.
+dependencies = [
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "structlog>=24.1",
+    "pdfplumber>=0.11",
+    "pypdf>=4.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "reportlab>=4.0",        # build small PDFs for extractor tests
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+    "ignore::DeprecationWarning:pdfplumber.*",
+    "ignore::DeprecationWarning:pypdf.*",
+]
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

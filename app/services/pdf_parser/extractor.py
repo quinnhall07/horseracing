@@ -176,9 +176,14 @@ def ingest_pdf(pdf_bytes: bytes, source_filename: str = "") -> IngestionResult:
 
     This function is synchronous — it is called from the FastAPI route via
     run_in_executor so it does not block the async event loop.
+
+    `processing_ms` is always populated in the response, regardless of
+    success — slow failures need to be observable too.
     """
     start_ms = time.perf_counter()
-    errors: list[str] = []
+
+    def _elapsed() -> float:
+        return round((time.perf_counter() - start_ms) * 1000, 1)
 
     # ── Size guard ─────────────────────────────────────────────────────────────
     if len(pdf_bytes) > settings.MAX_UPLOAD_SIZE_BYTES:
@@ -187,6 +192,7 @@ def ingest_pdf(pdf_bytes: bytes, source_filename: str = "") -> IngestionResult:
         return IngestionResult(
             success=False,
             errors=[f"File size {size_mb:.1f} MB exceeds maximum {max_mb:.0f} MB"],
+            processing_ms=_elapsed(),
         )
 
     # ── Text extraction ────────────────────────────────────────────────────────
@@ -196,12 +202,15 @@ def ingest_pdf(pdf_bytes: bytes, source_filename: str = "") -> IngestionResult:
             strategy=settings.PDF_EXTRACTION_STRATEGY,
         )
     except ValueError as exc:
-        return IngestionResult(success=False, errors=[str(exc)])
+        return IngestionResult(
+            success=False, errors=[str(exc)], processing_ms=_elapsed()
+        )
     except Exception as exc:
         logger.error("Unexpected extraction error", error=str(exc))
         return IngestionResult(
             success=False,
             errors=[f"PDF extraction failed: {type(exc).__name__}: {exc}"],
+            processing_ms=_elapsed(),
         )
 
     # ── Format detection ───────────────────────────────────────────────────────
@@ -218,27 +227,27 @@ def ingest_pdf(pdf_bytes: bytes, source_filename: str = "") -> IngestionResult:
         return IngestionResult(
             success=False,
             errors=[f"Parse error ({fmt}): {type(exc).__name__}: {exc}"],
+            processing_ms=_elapsed(),
         )
 
+    errors: list[str] = []
     success = card.n_races > 0
     if not success:
         errors.append("Parser produced zero races. Check that the PDF is a race card.")
-
-    elapsed_ms = (time.perf_counter() - start_ms) * 1000
 
     logger.info(
         "Ingestion complete",
         races=card.n_races,
         qualified=card.n_qualified_races,
         confidence_avg=_avg_confidence(card),
-        elapsed_ms=round(elapsed_ms, 1),
+        elapsed_ms=_elapsed(),
     )
 
     return IngestionResult(
         success=success,
         card=card if success else None,
         errors=errors,
-        processing_ms=round(elapsed_ms, 1),
+        processing_ms=_elapsed(),
     )
 
 

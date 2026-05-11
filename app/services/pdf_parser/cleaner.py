@@ -44,7 +44,10 @@ _LIGATURE_MAP: dict[str, str] = {
     # ½ / ¼ / ¾ also appear in distance strings ("5½f")
 }
 
-_MULTI_SPACE = re.compile(r" {2,}")
+# Pathological space runs (≥3) collapse to exactly two spaces. This bounds
+# whitespace blow-up while preserving the columnar gap that downstream parsers
+# (e.g., BrisnetParser._RE_HORSE_LINE) rely on as a column separator.
+_EXCESS_SPACE = re.compile(r" {3,}")
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
@@ -56,7 +59,8 @@ def normalize_text(raw: str) -> str:
       1. Map Unicode ligatures and typographic characters to ASCII equivalents
       2. Strip control characters (keep \\t and \\n for layout)
       3. Decompose remaining Unicode and strip combining marks
-      4. Collapse multiple spaces into single space
+      4. Cap pathological whitespace runs (3+ spaces → 2 spaces) while
+         preserving columnar alignment for downstream regex parsers
     """
     if not raw:
         return ""
@@ -68,9 +72,20 @@ def normalize_text(raw: str) -> str:
     # Step 3: NFC → NFKD decompose → strip combining marks → re-encode ASCII
     raw = unicodedata.normalize("NFKD", raw)
     raw = "".join(c for c in raw if not unicodedata.combining(c))
-    # Step 4: collapse internal whitespace (not newlines)
-    raw = _MULTI_SPACE.sub(" ", raw)
+    # Step 4: cap excess whitespace; preserve columnar gaps (2 spaces)
+    raw = _EXCESS_SPACE.sub("  ", raw)
     return raw.strip()
+
+
+def collapse_whitespace(raw: str) -> str:
+    """
+    Aggressively collapse all internal whitespace runs to a single space.
+
+    Use this for cleaning short value strings (names, descriptions) where
+    columnar alignment is not relevant. Distinct from `normalize_text`,
+    which preserves multi-space column separators.
+    """
+    return re.sub(r"\s+", " ", raw).strip() if raw else ""
 
 
 def clean_name(raw: str) -> str:
@@ -80,9 +95,10 @@ def clean_name(raw: str) -> str:
     Handles:
       • All-caps names (Brisnet style) → Title Case
       • Embedded asterisks (apprentice allowance markers on jockeys)
+      • Multi-space gaps (collapsed to single space — names are not columnar)
       • Leading/trailing punctuation
     """
-    cleaned = normalize_text(raw)
+    cleaned = collapse_whitespace(normalize_text(raw))
     # Remove apprentice marker (* or **)
     cleaned = re.sub(r"\*+$", "", cleaned).strip()
     # Brisnet prints names in ALL CAPS; convert to title case
@@ -146,13 +162,21 @@ def parse_odds_to_decimal(raw: str) -> Optional[float]:
 # Distance conversion
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Furlong fractions that appear in distance strings
+# Furlong fractions that appear in distance strings.
+# Coverage rationale: US racing uses 16ths and 8ths of a mile predominantly.
+# Common route distances: 1 1/16m, 1 1/8m, 1 3/16m, 1 1/4m, 1 3/8m, 1 1/2m, 1 5/8m.
 _FRACTION_MAP: dict[str, float] = {
-    "1/2": 0.5,
+    "1/16": 0.0625,
+    "3/16": 0.1875,
+    "5/16": 0.3125,
+    "7/16": 0.4375,
+    "1/8": 0.125,
+    "3/8": 0.375,
+    "5/8": 0.625,
+    "7/8": 0.875,
     "1/4": 0.25,
     "3/4": 0.75,
-    "1/8": 0.125,
-    "5/8": 0.625,
+    "1/2": 0.5,
     # Unicode variants (already normalised by clean_text, but belt-and-suspenders)
     "½": 0.5,
     "¼": 0.25,
@@ -171,15 +195,17 @@ _DISTANCE_UNITS: dict[str, float] = {
     "yards": 1.0 / 220.0,
 }
 
-# Pattern: optional integer, optional fraction, unit
+# Pattern: optional integer, optional fraction, unit.
+# Fraction alternation lists the multi-digit denominators first so the
+# engine doesn't greedily match "1/1" out of "1/16".
 _DISTANCE_RE = re.compile(
     r"""
     ^\s*
-    (?P<whole>\d+)?                                  # optional integer part
+    (?P<whole>\d+)?                                            # optional integer part
     \s*
-    (?P<frac>1/2|1/4|3/4|1/8|5/8|½|¼|¾)?           # optional fraction
+    (?P<frac>1/16|3/16|5/16|7/16|1/8|3/8|5/8|7/8|1/4|3/4|1/2|½|¼|¾)?
     \s*
-    (?P<unit>furlongs?|miles?|yards?|[fmF])\s*$     # required unit
+    (?P<unit>furlongs?|miles?|yards?|[fmF])\s*$               # required unit
     """,
     re.VERBOSE | re.IGNORECASE,
 )
