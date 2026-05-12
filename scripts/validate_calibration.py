@@ -34,6 +34,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -74,6 +75,9 @@ class CalibrationReport:
     n_test: int
     pre_bins: list[dict]
     post_bins: list[dict]
+    # New in ADR-037: how `chosen_method` was decided.
+    auto_selection_mode: Optional[str] = None
+    inner_val_metrics: Optional[dict] = None
 
     def asdict(self) -> dict:
         return {
@@ -130,11 +134,15 @@ def evaluate_calibration(
             }
             for b in reliability_bins(post_test, test_labels, n_bins=n_bins)
         ],
+        auto_selection_mode=cal.auto_selection_mode,
+        inner_val_metrics=cal.inner_val_metrics,
     )
     log.info(
         "calibration.evaluated",
         label=label,
         chosen=cal.chosen_method,
+        selection_mode=cal.auto_selection_mode,
+        inner_val=cal.inner_val_metrics,
         pre_ece=report.pre_ece, post_ece=report.post_ece,
         pre_brier=report.pre_brier, post_brier=report.post_brier,
     )

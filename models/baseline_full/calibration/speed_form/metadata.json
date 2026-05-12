@@ -1,0 +1,36 @@
+{
+  "artifact_version": "1",
+  "config": {
+    "method": "auto",
+    "n_bins_for_selection": 15,
+    "softmax_temperature": 1.0,
+    "seed": 23,
+    "auto_val_fraction": 0.2,
+    "auto_min_inner_val_size": 100,
+    "auto_min_delta_ece": 0.001
+  },
+  "chosen_method": "isotonic",
+  "metrics": {
+    "platt": {
+      "ece": 0.02226320474347754,
+      "brier": 0.0748890643984412,
+      "n_samples": 231942
+    },
+    "isotonic": {
+      "ece": 1.372329897819422e-18,
+      "brier": 0.07380282928176427,
+      "n_samples": 231942
+    }
+  },
+  "inner_val_metrics": {
+    "platt": {
+      "ece": 0.021268853764128633,
+      "n_val": 46388
+    },
+    "isotonic": {
+      "ece": 0.0034725216396808145,
+      "n_val": 46388
+    }
+  },
+  "auto_selection_mode": "held_out"
+}

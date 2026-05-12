@@ -168,27 +168,93 @@ def test_auto_selector_records_chosen_method():
     raw, labels = _biased_synthetic()
     cal = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
     assert cal.chosen_method in ("platt", "isotonic")
-    # Auto must hold metrics for BOTH candidate methods.
+    # Auto holds fit-slice metrics for BOTH candidate methods (diagnostic),
+    # AND inner-val metrics that drive the selection itself.
     assert cal.metrics is not None
     assert "platt" in cal.metrics
     assert "isotonic" in cal.metrics
-    # The chosen method's ECE must be the minimum.
-    chosen_ece = cal.metrics[cal.chosen_method]["ece"]
-    other_ece = cal.metrics["isotonic" if cal.chosen_method == "platt" else "platt"]["ece"]
-    assert chosen_ece <= other_ece + 1e-9
+    assert cal.inner_val_metrics is not None
+    assert "platt" in cal.inner_val_metrics
+    assert "isotonic" in cal.inner_val_metrics
+    # The chosen method must be the inner-val winner (with the
+    # auto_min_delta_ece protective bias toward Platt on ties — see ADR-037).
+    platt_iv = cal.inner_val_metrics["platt"]["ece"]
+    iso_iv = cal.inner_val_metrics["isotonic"]["ece"]
+    if cal.chosen_method == "isotonic":
+        assert iso_iv + cal.config.auto_min_delta_ece < platt_iv
+    else:
+        assert iso_iv + cal.config.auto_min_delta_ece >= platt_iv
 
 
 def test_auto_picks_isotonic_when_distortion_is_non_sigmoidal():
     """A staircase distortion (3 plateaus) is non-sigmoidal — isotonic fits
-    it exactly while Platt's logistic cannot."""
+    it exactly while Platt's logistic cannot. Held-out inner-val confirms
+    isotonic genuinely generalises."""
     rng = np.random.default_rng(13)
     n = 3000
     raw = rng.uniform(0, 1, n)
-    # Staircase distortion: 0 → 0.1, mid → 0.5, high → 0.9.
     true_p = np.where(raw < 0.33, 0.1, np.where(raw < 0.66, 0.5, 0.9))
     labels = (rng.uniform(0, 1, n) < true_p).astype(int)
     cal = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
     assert cal.chosen_method == "isotonic"
+    assert cal.auto_selection_mode == "held_out"
+
+
+def test_auto_picks_platt_on_already_calibrated_stream():
+    """When raw scores are ALREADY well-calibrated probabilities, isotonic
+    can only overfit. Held-out auto-selector should pick Platt (the simpler
+    model) — confirming the ADR-037 fix.
+    """
+    rng = np.random.default_rng(2026)
+    n = 4000
+    raw = rng.uniform(0.05, 0.6, n)
+    # True P = raw (perfectly calibrated already).
+    labels = (rng.uniform(0, 1, n) < raw).astype(int)
+    cal = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
+    assert cal.chosen_method == "platt"
+    assert cal.auto_selection_mode == "held_out"
+
+
+def test_auto_held_out_inner_val_records_both_method_eces():
+    """Inner-val metrics dict captures both Platt and isotonic ECE for
+    diagnostic transparency."""
+    raw, labels = _biased_synthetic(n=4000)
+    cal = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
+    iv = cal.inner_val_metrics
+    assert iv is not None
+    assert iv["platt"]["n_val"] == int(4000 * cal.config.auto_val_fraction)
+    assert iv["isotonic"]["n_val"] == int(4000 * cal.config.auto_val_fraction)
+    assert 0.0 <= iv["platt"]["ece"] <= 1.0
+    assert 0.0 <= iv["isotonic"]["ece"] <= 1.0
+
+
+def test_auto_falls_back_to_fit_slice_on_small_calib():
+    """For calib slice too small to hold a meaningful inner-val,
+    auto_selection_mode is 'fit_slice_fallback'."""
+    rng = np.random.default_rng(31)
+    n = 50  # 20% inner-val = 10 rows, below default min 100.
+    raw = rng.uniform(0, 1, n)
+    labels = (rng.uniform(0, 1, n) < raw).astype(int)
+    cal = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
+    assert cal.auto_selection_mode == "fit_slice_fallback"
+    assert cal.chosen_method in ("platt", "isotonic")
+
+
+def test_auto_min_delta_ece_protects_against_noise_swap():
+    """When isotonic and Platt give very close inner-val ECE, raising
+    auto_min_delta_ece forces Platt (simpler model). Verify the threshold
+    works as documented."""
+    rng = np.random.default_rng(11)
+    n = 2000
+    # Mild biased synthetic where Platt and isotonic should be ≈ tied.
+    raw = rng.uniform(0, 1, n)
+    true_p = 0.5 + 0.1 * (raw - 0.5)  # gentle linear shift around 0.5
+    labels = (rng.uniform(0, 1, n) < true_p).astype(int)
+    # With a generous min_delta=0.1 (=10% ECE advantage required), Platt
+    # should always win — no real-world distortion gives that gap on
+    # this synthetic.
+    cal = Calibrator(CalibratorConfig(method="auto", auto_min_delta_ece=0.1)).fit(raw, labels)
+    assert cal.chosen_method == "platt"
 
 
 # ── Calibrator: predict_softmax ───────────────────────────────────────────

@@ -15,8 +15,14 @@ Two estimators are implemented:
     * Isotonic regression — non-parametric piecewise-constant fit. Handles
       arbitrary monotone distortions but needs more data to be stable.
 
-The "auto" method fits both, computes Expected Calibration Error (ECE) on
-the fit set, and keeps the one with lower ECE — per ADR-008.
+The "auto" method fits both on an inner-train slice (default 80% of the
+fit data, seeded random shuffle), evaluates ECE on the held-out inner-val
+slice (default 20%), and keeps the one with lower inner-val ECE —
+isotonic must beat Platt by `auto_min_delta_ece` (default 0.001) to be
+chosen, giving a one-sided protective bias toward the simpler model.
+Both calibrators are then re-fit on the FULL fit data so no data is
+wasted. See ADR-037 — this corrects the fit-slice criterion in ADR-030
+that overfit to isotonic memorisation.
 
 Per-race softmax (with optional temperature) renormalises the calibrated
 per-row probabilities so each race sums to 1.
@@ -142,13 +148,28 @@ def brier_score(probs: np.ndarray, labels: np.ndarray) -> float:
 class CalibratorConfig:
     """Calibrator hyperparameters."""
     method: str = "auto"
-    """One of 'platt', 'isotonic', 'auto'. 'auto' selects via ECE."""
+    """One of 'platt', 'isotonic', 'auto'. 'auto' selects via held-out
+    inner-val ECE (NOT fit-slice ECE — see ADR-037)."""
     n_bins_for_selection: int = 15
     """Bin count fed into the ECE that drives auto-selection."""
     softmax_temperature: float = 1.0
     """Temperature T applied to the logit form of calibrated probabilities
     before per-race softmax. T<1 sharpens, T>1 flattens."""
     seed: int = 23
+    auto_val_fraction: float = 0.2
+    """Fraction of the fit slice held out as an inner-val set for auto-
+    selection. Random seeded split. Used only when `method='auto'` AND
+    the fit slice has at least `auto_min_inner_val_size` would-be val
+    rows; otherwise we fall back to fit-slice ECE with a warning."""
+    auto_min_inner_val_size: int = 100
+    """If the inner-val split would have fewer rows than this, fall back
+    to fit-slice ECE selection (with a warning). Inner-val ECE on a tiny
+    slice is too noisy to rely on."""
+    auto_min_delta_ece: float = 0.001
+    """Minimum inner-val ECE advantage isotonic must show over Platt to
+    be chosen by `method='auto'`. Default 0.001 (= 0.1% ECE) introduces
+    a small protective bias toward the simpler model when the two are
+    statistically tied. Set to 0 to choose strictly by lower ECE."""
 
 
 @dataclass
@@ -182,6 +203,8 @@ class Calibrator:
         self._isotonic: Optional[IsotonicRegression] = None
         self.chosen_method: Optional[str] = None
         self.metrics: Optional[dict[str, dict]] = None
+        self.inner_val_metrics: Optional[dict[str, dict]] = None
+        self.auto_selection_mode: Optional[str] = None  # "held_out" | "fit_slice_fallback" | None
 
     # ── Fit ───────────────────────────────────────────────────────────────
 
@@ -196,12 +219,26 @@ class Calibrator:
         _validate_lengths(scores, labels)
 
         method = self.config.method
+        if method == "auto":
+            chosen, inner_val_metrics, sel_mode = self._auto_select(scores, labels)
+            self.chosen_method = chosen
+            self.inner_val_metrics = inner_val_metrics
+            self.auto_selection_mode = sel_mode
+        else:
+            self.chosen_method = method
+            self.inner_val_metrics = None
+            self.auto_selection_mode = None
+
+        # Always (re-)fit on the FULL fit slice so no data is wasted, AND
+        # so the metrics dict can report fit-slice ECE/Brier for both
+        # candidate methods (useful for diagnostics / comparison with the
+        # inner-val choice).
         if method in ("platt", "auto"):
             self._platt = _fit_platt(scores, labels, seed=self.config.seed)
         if method in ("isotonic", "auto"):
             self._isotonic = _fit_isotonic(scores, labels)
 
-        # Compute metrics for whatever was fit.
+        # Compute fit-slice metrics for whatever was fit.
         metrics: dict[str, dict] = {}
         if self._platt is not None:
             p = _predict_platt(self._platt, scores)
@@ -222,21 +259,98 @@ class Calibrator:
                 n_samples=len(scores),
             ).asdict()
 
-        if method == "auto":
-            # Pick whichever achieves the lower ECE.
-            self.chosen_method = min(metrics, key=lambda k: metrics[k]["ece"])
-        else:
-            self.chosen_method = method
-
         self.metrics = metrics
         log.info(
             "calibrator.fit_complete",
             method=method,
             chosen=self.chosen_method,
+            selection_mode=self.auto_selection_mode,
             metrics=metrics,
+            inner_val_metrics=self.inner_val_metrics,
             n_samples=len(scores),
         )
         return self
+
+    def _auto_select(
+        self, scores: np.ndarray, labels: np.ndarray,
+    ) -> tuple[str, dict, str]:
+        """Pick platt vs isotonic by held-out inner-val ECE.
+
+        Returns (chosen_method, inner_val_metrics_dict, selection_mode).
+        selection_mode is "held_out" when an inner split was used,
+        "fit_slice_fallback" when the fit slice was too small.
+        """
+        n = len(scores)
+        n_val = int(n * self.config.auto_val_fraction)
+
+        # Fall back to fit-slice ECE for very small calib slices — inner-val
+        # ECE on < min_inner_val_size rows is too noisy to trust.
+        if n_val < self.config.auto_min_inner_val_size:
+            log.warning(
+                "calibrator.auto_using_fit_slice_fallback",
+                n=n, n_val=n_val,
+                min_inner_val_size=self.config.auto_min_inner_val_size,
+            )
+            platt = _fit_platt(scores, labels, seed=self.config.seed)
+            iso = _fit_isotonic(scores, labels)
+            platt_ece = expected_calibration_error(
+                _predict_platt(platt, scores), labels,
+                n_bins=self.config.n_bins_for_selection,
+            )
+            iso_ece = expected_calibration_error(
+                _predict_isotonic(iso, scores), labels,
+                n_bins=self.config.n_bins_for_selection,
+            )
+            chosen = (
+                "isotonic" if iso_ece + self.config.auto_min_delta_ece < platt_ece
+                else "platt"
+            )
+            return (
+                chosen,
+                {
+                    "platt": {"ece": float(platt_ece), "n_val": int(n)},
+                    "isotonic": {"ece": float(iso_ece), "n_val": int(n)},
+                },
+                "fit_slice_fallback",
+            )
+
+        # Random seeded split inside the fit slice. Time-isolation is
+        # enforced at the OUTER split (the calib slice itself is a
+        # contiguous time window); inside the slice a random split is
+        # appropriate for choosing between two 1-D calibration maps.
+        rng = np.random.default_rng(self.config.seed)
+        perm = rng.permutation(n)
+        val_idx = perm[:n_val]
+        train_idx = perm[n_val:]
+
+        s_tr, l_tr = scores[train_idx], labels[train_idx]
+        s_val, l_val = scores[val_idx], labels[val_idx]
+
+        platt_inner = _fit_platt(s_tr, l_tr, seed=self.config.seed)
+        iso_inner = _fit_isotonic(s_tr, l_tr)
+
+        platt_ece = expected_calibration_error(
+            _predict_platt(platt_inner, s_val), l_val,
+            n_bins=self.config.n_bins_for_selection,
+        )
+        iso_ece = expected_calibration_error(
+            _predict_isotonic(iso_inner, s_val), l_val,
+            n_bins=self.config.n_bins_for_selection,
+        )
+        # Isotonic wins only if it beats Platt by min_delta_ece on inner-val.
+        # Default min_delta=0.001 protects against noise-driven swaps.
+        chosen = (
+            "isotonic" if iso_ece + self.config.auto_min_delta_ece < platt_ece
+            else "platt"
+        )
+        return (
+            chosen,
+            {
+                "platt": {"ece": float(platt_ece), "n_val": int(n_val)},
+                "isotonic": {"ece": float(iso_ece), "n_val": int(n_val)},
+            },
+            "held_out",
+        )
 
     # ── Predict ───────────────────────────────────────────────────────────
 
@@ -298,6 +412,8 @@ class Calibrator:
             "config": asdict(self.config),
             "chosen_method": self.chosen_method,
             "metrics": self.metrics or {},
+            "inner_val_metrics": self.inner_val_metrics or {},
+            "auto_selection_mode": self.auto_selection_mode,
         }
         with open(path / "metadata.json", "w") as fh:
             json.dump(meta, fh, indent=2, default=str)
@@ -319,6 +435,8 @@ class Calibrator:
             obj._isotonic = joblib.load(iso_path)
         obj.chosen_method = meta["chosen_method"]
         obj.metrics = meta.get("metrics") or None
+        obj.inner_val_metrics = meta.get("inner_val_metrics") or None
+        obj.auto_selection_mode = meta.get("auto_selection_mode")
         return obj
 
 

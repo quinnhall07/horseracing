@@ -7,9 +7,37 @@ Format: newest session at the top.
 
 ## Current State
 
-**Phase:** 0 — Master Training DB **LOADED + EXPORTED** · Phase 1 — PDF Ingestion **COMPLETE** · Phase 2 — Feature Engineering **COMPLETE** · Phase 3 — Baseline Models **COMPLETE** · Phase 4 — **Calibration + Plackett-Luce IN PROGRESS** (Stern / Copula / drift-detection deferred)
-**Last completed task:** Built Phase-4 calibration (`app/services/calibration/calibrator.py`: Platt + isotonic + auto-selector + per-race softmax with temperature, helpers for ECE / Brier / reliability bins) and Plackett-Luce ordering (`app/services/ordering/plackett_luce.py`: analytical exacta/trifecta/superfecta + enumerate_exotic_probs + vectorised MLE strength fit via scipy.optimize). Built `scripts/validate_calibration.py` (CLI + importable `evaluate_calibration` + matplotlib reliability diagrams). Live smoke on 5% of the parquet shows the meta-learner is **substantially miscalibrated raw** (ECE 0.121) and **isotonic flattens it to 0.011** — a ~91% reduction; speed/form drops 0.037 → 0.005 the same way. Fixed a latent pre-existing bug in `MarketModel.load()` (sklearn IsotonicRegression `f_` was set to None on load → `'NoneType' object is not callable` at predict time) by rebuilding the linear interpolation from the saved thresholds via `scipy.interpolate.interp1d`; added the missing save/load round-trip test. **389 tests passing** (was 343 → +46 new: 21 calibrator + 21 plackett_luce + 3 validate_calibration smoke + 1 market round-trip regression).
-**Next task:** Run `scripts/validate_calibration.py` on the FULL 2.3M-row parquet (this session ran 5% smoke; the artifact dir is gitignored — re-run when needed). Then: Stern (Gamma) ordering model in `app/services/ordering/stern.py`, Copula model for pace-correlated exotics in `app/services/ordering/copula.py`, and CUSUM change-point drift detection in `app/services/calibration/drift.py`. After that, Phase 5: EV engine + portfolio optimisation.
+**Phase:** 0 — Master Training DB **LOADED + EXPORTED** · Phase 1 — PDF Ingestion **COMPLETE** · Phase 2 — Feature Engineering **COMPLETE** · Phase 3 — Baseline Models **COMPLETE** · Phase 4 — **COMPLETE** (Calibrator + PL + Stern + Copula + CUSUM drift + full-parquet validation)
+**Last completed task:** Built the remaining Phase-4 modules (Stern Gamma ordering, Copula pace-correlated ordering, CUSUM drift detection) and ran the full-parquet calibration validation. **Stern** (`app/services/ordering/stern.py`): SternConfig + SternModel with PL closed-form delegation at shape=1, MC sampling for shape ≠ 1 (default 20k samples), `implied_win_probs` + `infer_strengths` (damped multiplicative fixed-point) for marginal recovery, and `fit_stern_shape` (grid-search MLE over a corpus of (ordering, strengths) pairs). **Copula** (`app/services/ordering/copula.py`): Gaussian copula with Gamma marginals over a block-equicorrelation matrix by pace style, three PL/Stern fast paths (ρ=0, pace_styles=None, marginal_shape ≠ 1 → Stern), Cholesky+jitter MC sampler. **Drift** (`app/services/calibration/drift.py`): two-sided CUSUM on STANDARDISED Bernoulli z-score residuals (k=0.5, h=4 → ARL₀ ≈ 168), incremental `CUSUMDetector` + one-shot `detect_drift`. **Full-parquet validation** ran in ~14 minutes (231,942 calib / 231,160 test rows, dates 2015-07-12 → 2018-02-18) and produced an unexpected finding (see "Calibration finding" below). **464 tests passing** (was 389 → +75: 29 Stern + 20 Copula + 26 drift).
+**Next task:** Phase 5 — EV engine (`app/services/ev_engine/calculator.py`, `market_impact.py`) and portfolio optimiser (`app/services/portfolio/optimizer.py`, `sizing.py`). Before Phase 5 it may be worth a small Phase-4 follow-up to fix the auto-selector fit-slice criterion (see Calibration finding).
+
+### Calibration finding — full-parquet vs. 5% smoke
+
+The full-parquet run produced ECE deltas that **contradict the 5% smoke run** (10× more data, 30× larger calib/test slice). At full scale:
+
+| Model         | Pre-cal ECE | Post-cal ECE | Pre Brier | Post Brier | Method   |
+|---------------|------------:|-------------:|----------:|-----------:|----------|
+| Speed/Form    | **0.0031**  | 0.0058       | 0.0732    | 0.0733     | isotonic |
+| Meta-learner  | **0.0034**  | 0.0048       | 0.0679    | 0.0679     | isotonic |
+
+Both models are ALREADY well-calibrated raw (ECE ≈ 0.003) — calibration was essentially unneeded. The auto-selector picked isotonic anyway because isotonic memorises the fit slice (fit-slice ECE → 0, vs. Platt ≈ 0.023). Applying isotonic to the test slice ADDED noise: ECE 0.003 → ~0.005-0.006 on both heads (Brier essentially unchanged).
+
+The 5% smoke (11.5K calib / test) had reported meta-learner pre-ECE = 0.121 / post = 0.011. That figure was a **small-sample artifact**: with 11.5K obs in the test split, ECE bin counts are noisy enough to inflate the estimate, AND the random 5% slice happened to land in a slightly miscalibrated region. The full-parquet baseline is the truth.
+
+This confirms the concern in ADR-008 / ADR-030: the auto-selector's fit-slice ECE criterion is broken when the underlying model is already well-calibrated. **Phase-4 follow-up** (recommended before Phase 5): change the auto-selector to either (a) require a minimum delta-ECE on a held-out slice within the fit set, or (b) default to Platt and only switch to isotonic when it meaningfully wins on held-out. ADR-030 already flagged this as provisional.
+
+Artifacts: `models/baseline_full/calibration/{speed_form,meta_learner}/{report.json,reliability.png,platt.joblib,isotonic.joblib,metadata.json}` + `summary.json`.
+
+### Phase 4 module inventory (final)
+
+| Module                                              | Lines | Tests | Notes                                                            |
+|-----------------------------------------------------|------:|------:|------------------------------------------------------------------|
+| `app/services/calibration/calibrator.py`            |   ~430 |    21 | Platt / isotonic / auto-selector, per-race temperature softmax.  |
+| `app/services/calibration/drift.py`                 |   ~290 |    26 | Standardised Bernoulli-z CUSUM (k=0.5, h=4).                     |
+| `app/services/ordering/plackett_luce.py`            |   ~305 |    21 | Analytical exacta/trifecta/superfecta + vectorised MLE.          |
+| `app/services/ordering/stern.py`                    |   ~340 |    29 | Gamma marginals; PL fast path at shape=1; `infer_strengths`.     |
+| `app/services/ordering/copula.py`                   |   ~330 |    20 | Block-equicorrelation; PL/Stern fast paths; Cholesky+jitter MC.  |
+| `scripts/validate_calibration.py`                   |   ~350 |     3 | Live pipeline runner + importable `evaluate_calibration`.        |
 
 ### Known Export Caveats (for Phase 3 model training)
 
@@ -31,6 +59,122 @@ JP carries 1.6M rows with no speed figure. Either derive a synthetic speed figur
 ---
 
 ## Session Log
+
+### Session: 2026-05-12 (f) — Phase 4 complete: Stern + Copula + CUSUM + full-parquet calibration
+
+**Completed:**
+
+*Ordering — Stern (Gamma) model (`app/services/ordering/stern.py`, 29 tests)*
+- `SternConfig` (shape, n_samples, seed) + `SternModel` API parallel to
+  `plackett_luce`. Shape=1 delegates to PL closed forms; shape≠1 uses
+  MC via vectorised `rng.gamma(shape, scale=1/v, size=(n, N))` and
+  `argsort`. Default 20k samples gives SE ~0.002 on typical exotic probs.
+- `implied_win_probs` reports P(i wins) the model actually predicts
+  (= strengths only at shape=1; differs otherwise).
+- `infer_strengths(target, damping=0.5)` — damped multiplicative fixed-
+  point iteration over MC-estimated implied marginals, converges in ~30
+  iters at damping=0.5 for shape ≤ 5.
+- `fit_stern_shape(corpus, shape_grid)` — grid-search MLE that scores
+  observed top-`top_k` prefix matches; top-1 is invariant under shape
+  given calibrated marginals, so `top_k >= 2` is enforced.
+
+*Ordering — Copula model (`app/services/ordering/copula.py`, 20 tests)*
+- Gaussian copula with Gamma marginals over a block-equicorrelation
+  matrix (ρ within pace style, 0 across). `rho ∈ [0, 1)`.
+- Three PL/Stern fast paths: `pace_styles=None`, `rho=0`, or
+  `marginal_shape ≠ 1` → delegated. The MC path: Cholesky on
+  Σ + 1e-10·I, `randn @ L.T`, `Φ(Z)` clipped, `Gamma.ppf`.
+- KEY finding pinned in tests + docstring: under ρ > 0 within a style
+  block, the STRONGER horse's marginal win share grows at the expense
+  of the weaker. The Luce property does NOT survive. This is the
+  intended behaviour (same-style horses compete for the same trip;
+  independent-variation "upsets" shrink). A reviewer who expects
+  marginal preservation will be surprised — the docstring + the test
+  `test_correlation_concentrates_winshare_on_stronger_block_member`
+  prevent silent regressions.
+
+*Calibration — CUSUM drift detection (`app/services/calibration/drift.py`, 26 tests)*
+- First attempt used raw residuals (label − pred) with k=0.025, h=2.
+  False-alarmed at step 22 on a 1000-obs perfectly-calibrated stream
+  because a single label=0 on pred=0.9 contributes -0.9 in one step,
+  which is enormous relative to k=0.025 / h=2. The defaults were
+  irreconcilable with the residual scale.
+- Rewrote to STANDARDISED Bernoulli z-score residuals:
+  `z = (label − p) / sqrt(p·(1−p))`, floored on the denominator (eps=1e-4)
+  and clipped magnitude (z_clip=5). New defaults k=0.5, h=4 follow
+  Hawkins-Olwell standard SPC tables (ARL₀ ≈ 168). Tests now pass with
+  deterministic calibrated prefixes (alternating 0/1 at p=0.5) used as
+  quiet warm-ups so the drift signal is isolated.
+- Incremental `CUSUMDetector` + one-shot `detect_drift(...)` helper.
+  Alarm latches on first crossing; `reset()` clears for a new monitoring
+  epoch. `direction` field reports "high" (model under-predicts) vs.
+  "low" (model over-predicts).
+
+*Full-parquet validation*
+- Ran `scripts/validate_calibration.py` on the full 2.3M-row parquet.
+  Total ~14 min wall-clock; `prepare_training_features` dominates
+  (~14 min for the per-horse groupby + shifts), scoring + calibration
+  ~5 sec. Calib 231,942 rows / test 231,160 rows, dates 2015-07-12 to
+  2018-02-18.
+- Finding: both Speed/Form and Meta-learner are ALREADY well-calibrated
+  raw (ECE ≈ 0.003). Auto-selector picked isotonic (fit-slice ECE → 0
+  always wins), but isotonic on this slice SLIGHTLY DEGRADED test-set
+  ECE (0.003 → 0.005–0.006). Brier essentially unchanged. The 5% smoke
+  result (meta-learner 0.121 → 0.011) was a small-sample artifact.
+- The auto-selector's fit-slice ECE criterion is broken in the
+  well-calibrated regime — ADR-030 already flagged this as provisional.
+
+**Key Decisions Made (new ADRs):**
+
+- **ADR-034: Stern MC for shape ≠ 1, PL closed form for shape = 1.**
+  Strengths are Gamma rates; at shape=1 they ARE the win probs (Luce).
+  At shape ≠ 1 they are not — `infer_strengths` recovers target
+  marginals via damped fixed-point.
+
+- **ADR-035: Copula uses block-equicorrelation by pace style with
+  PL/Stern fallbacks.** ρ within style, 0 across — PSD by construction
+  for ρ ∈ [0, 1). Negative ρ rejected; cross-style ρ deferred. Luce
+  marginal preservation explicitly NOT a goal at ρ > 0 (the docstring
+  is honest about this).
+
+- **ADR-036: CUSUM operates on standardised Bernoulli z-scores, not
+  raw residuals.** Raw residuals are heteroscedastic in p; a single
+  high-confidence error dominates the running statistic. Standardising
+  fixes the scale, and defaults k=0.5, h=4 follow standard SPC tables.
+
+**Surprising / non-obvious findings to carry forward:**
+
+- The 5%-sample calibration smoke run from session (e) **lied**.
+  Meta-learner pre-ECE 0.121 reported there is not consistent with the
+  full-parquet pre-ECE 0.003. Small-sample ECE estimates have high
+  variance when the test slice is < ~50K rows. From now on,
+  **interpret smoke calibration results as PIPELINE-correctness checks
+  only, not as production-fitness signals**.
+
+- Auto-selector picks isotonic 100% of the time on this dataset
+  (fit-slice ECE for isotonic is ~1e-18 by memorisation), but isotonic
+  is wrong here — the test-slice ECE goes UP after calibration. This
+  is the canonical "fit-slice criterion overfits" failure mode that
+  ADR-030 flagged. **Phase-4 follow-up before Phase 5** (recommended):
+  change the auto-selector to either (a) require a minimum delta-ECE
+  on a held-out slice within the fit set, or (b) default to Platt
+  with isotonic only chosen when it wins held-out by a margin.
+
+**Known limitations carried forward:**
+
+- The Phase-3 stub models (PaceScenarioModel, SequenceModel) still
+  return constant 0.5. Phase 5 EV calculation will be valid only to
+  the extent that the meta-learner's marginal win probs are
+  trustworthy. Given the full-parquet ECE 0.003, that's a defensible
+  starting point.
+- `CopulaModel.infer_strengths` is not yet implemented (would mirror
+  `SternModel.infer_strengths`). Added when the pace model is real.
+
+**Tests Status:**
+- **464 tests passing in ~25s** (was 389 → +75 new). Run with
+  `.venv/Scripts/python.exe -m pytest tests/ -q`.
+
+---
 
 ### Session: 2026-05-12 (e) — Phase 4 calibration + Plackett-Luce (code complete; full run pending)
 

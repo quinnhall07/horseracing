@@ -1020,8 +1020,10 @@ inline in `training_data.py` with a TODO pointing at the proper fix
 ## ADR-030: Calibrator Selects on Fit-Slice ECE (Provisional)
 
 **Date:** 2026-05-12
-**Status:** Accepted (provisional — strengthen to cross-validated selection
-if Platt and isotonic start trading wins on the full parquet)
+**Status:** Superseded by ADR-037 (2026-05-12) — the full-parquet
+validation surfaced the failure mode this ADR called "the case where
+Platt wins on the test slice but isotonic wins on the fit slice".
+The fit-slice criterion now falls back to held-out inner-val ECE.
 
 **Context:**
 ADR-008 specified cross-validated ECE selection between Platt scaling and
@@ -1281,3 +1283,279 @@ is NaN — which can only be true if the shift(1) is actually wired up.
 - Drop the first row of every horse from training (no priors available) —
   rejected (the model should learn FTS behaviour; dropping them is a
   separate, opt-in toggle via `drop_first_starts=True`).
+
+---
+
+## ADR-034: Stern Model — MC for shape ≠ 1, PL Closed Form for shape = 1
+
+**Date:** 2026-05-12
+**Status:** Accepted
+
+**Context:**
+ADR-001 names Stern (Gamma) as the preferred ordering model. The Stern
+model assigns each horse a Gamma-distributed finishing time
+`T_i ~ Gamma(shape=r, rate=v_i)`. For r=1 the model is exactly
+Plackett-Luce (the Luce property `P(i wins) = v_i/Σv_j` holds and all
+top-k probabilities have closed forms). For r ≠ 1 no closed form exists
+— we need Monte Carlo over sampled finishing times.
+
+**Decision:**
+`SternModel.exacta_prob`, `.trifecta_prob`, `.superfecta_prob`, and
+`.enumerate_exotic_probs` delegate to `plackett_luce.*` when
+`config.shape == 1.0`. For all other shapes they invoke
+`sample_orderings` (default 20,000 samples) and tabulate empirical
+top-k frequencies.
+
+The strengths input is interpreted as Gamma RATE parameters (higher =
+faster). At shape=1 the rates ARE the win probabilities (Luce). At shape
+≠ 1 the rates no longer match marginal win probs; the caller can recover
+target marginals via `infer_strengths`, a damped multiplicative
+fixed-point iteration `v ← v · (target/implied)^damping` that converges
+in ~30 iterations at damping=0.5.
+
+**Rationale:**
+- The PL fast path keeps the common case (shape=1) analytic — no MC
+  noise, no n_samples knob to tune in production. The Stern test suite
+  asserts byte-identical results vs the PL module at shape=1.
+- Monte Carlo is the only tractable path for r ≠ 1. Closed-form
+  exotic probabilities under Gamma marginals involve nested incomplete
+  gamma integrals; numerical quadrature is slower than 20k MC samples
+  AND has its own discretisation error.
+- Vectorised sampling via `rng.gamma(shape, scale=1/v, size=(n, N))` is
+  fast (≈ 1ms for N=12, n=20,000 on a laptop). MC noise on a typical
+  exacta probability (p ≈ 0.1) is SE ≈ 0.002 — well below the
+  ~1% calibration noise floor.
+- `infer_strengths` is needed because at shape > 1 the strong horse
+  in any pair captures more than its Luce share; downstream EV would be
+  miscalibrated unless we invert. Damping=0.5 was tuned empirically;
+  undamped iteration oscillates for shape ≥ 3.
+
+**Rejected Alternatives:**
+- Closed-form exact via incomplete gamma integration — rejected
+  (slower than MC for any practical accuracy target; only the exacta
+  case is even reasonably tractable; trifecta/superfecta require nested
+  quadrature).
+- Always use MC, even at shape=1 — rejected (introduces MC noise where
+  none is needed; PL closed form is exact and free).
+- Treat shape as a per-race parameter — rejected for now (shape is a
+  global "determinism" knob; making it per-race adds parameters without
+  obvious benefit until we've established the global-shape baseline).
+
+---
+
+## ADR-035: Copula — Block-Equicorrelation by Pace Style, with PL/Stern Fallbacks
+
+**Date:** 2026-05-12
+**Status:** Accepted
+
+**Context:**
+ADR-001 names a copula-based ordering model as the Phase-4 target. PL
+and Stern both assume INDEPENDENT finishing times — wrong when horses
+share a pace style. Two front-runners who hook up early both fade
+together; two closers benefit from the same fast pace. The copula
+captures this dependency between same-style horses.
+
+**Decision:**
+`CopulaModel` builds a Gaussian copula with Gamma marginals:
+`Z ~ MVN(0, Σ)`, `U = Φ(Z)`, `T = Gamma_inv(U; shape, 1/v)`. The
+correlation matrix is BLOCK-EQUICORRELATION: ρ within each pace-style
+group, 0 across groups. PSD is guaranteed for any ρ ∈ [0, 1).
+
+Three explicit fast paths short-circuit Monte Carlo:
+1. `pace_styles=None` AND `marginal_shape=1.0` → exact PL.
+2. `rho=0.0` AND `marginal_shape=1.0` → exact PL.
+3. Either of the above with `marginal_shape ≠ 1.0` → delegates to
+   `SternModel` (which itself goes to MC).
+
+Otherwise: MC via Cholesky factor of Σ + jitter (1e-10), drawing
+standard normals, mapping to uniforms via `scipy.stats.norm.cdf`, then
+to Gamma quantiles via `scipy.stats.gamma.ppf`. Default 20k samples.
+
+**Rationale:**
+- Block-equicorrelation is the minimal pace-aware extension. Cross-
+  style correlation is a research question we defer; the literature on
+  exotic correlation structures is thin and the data-required-to-
+  identify-cross-style-correlation is large.
+- PSD safety: block-equicorrelation has analytic eigenvalues
+  {1-ρ, ρ(k-1)+1} per block, all positive for ρ ∈ [0, 1). Adding
+  diagonal jitter handles roundoff at ρ near 1.
+- The Luce property does NOT survive same-style positive correlation:
+  within a style block the stronger horse's marginal win share grows at
+  the expense of the weaker. This is the entire POINT of the copula
+  (same-style horses compete for the same trip; one can't "happen to be
+  faster than expected" while its block-mate stays calibrated). The
+  module docstring + tests pin this directionality.
+- Cross-style correlation = 0 keeps the model interpretable: tuning ρ
+  has a single, signed effect (more ρ → stronger same-style concentration).
+
+**Rejected Alternatives:**
+- Full unstructured correlation matrix Σ — rejected. Needs O(N²)
+  parameters with no clear identification source.
+- Vine copula / t-copula — rejected for now (added complexity over
+  Gaussian; no evidence racing residuals are heavy-tailed enough to
+  warrant t).
+- Force PL marginals to survive at ρ > 0 by inverting strengths
+  per-call — rejected for v1. The mathematical machinery exists
+  (analogous to `SternModel.infer_strengths`) but adds runtime cost
+  without a downstream consumer yet. The pace model is a stub today;
+  marginal preservation can be added when there's a production pipeline
+  for it.
+- Negative ρ — rejected. Negative cross-style correlation isn't
+  motivated by the racing literature, and validating PSD with mixed-
+  sign block correlations is non-trivial.
+
+---
+
+## ADR-036: CUSUM Drift Detector Operates on Standardised Bernoulli Residuals
+
+**Date:** 2026-05-12
+**Status:** Accepted
+
+**Context:**
+We need an online statistic that detects when the calibrator has drifted
+out of spec so the operator can refit. A raw-residual CUSUM (S+ = max(0,
+S+ + r - k) where r = label - pred) is overly sensitive to individual
+high-confidence observations: a single label=0 on a pred=0.9 contributes
+-0.9 in one step, which can cross any reasonable h threshold by itself.
+Our initial implementation with raw residuals false-alarmed on a 1000-obs
+calibrated stream at step 22.
+
+**Decision:**
+The CUSUM updates on the STANDARDISED (Bernoulli z-score) residual
+
+    z_t = (label_t − p_t) / sqrt(p_t · (1 − p_t))
+
+with two numerical guards: `sqrt(p·(1-p))` is floored at `eps` (default
+1e-4) to avoid div-by-zero at p ≈ 0 or 1, and z_t is then clipped to
+`[-z_clip, +z_clip]` (default 5).
+
+Under perfect calibration, each z_t has mean 0 and variance 1 regardless
+of p_t. CUSUM defaults: `k=0.5` (σ-units), `h=4.0` (σ-units),
+corresponding to ARL₀ ≈ 168 (per Hawkins-Olwell standard tables).
+
+**Rationale:**
+- The standardised residual gives each observation the same expected
+  weight under calibration. A label=0 on pred=0.9 contributes
+  z = -3 (capped at -5 by z_clip) — large, but bounded. A label=1 on
+  pred=0.5 contributes z = +1. The accumulation is variance-stable
+  across the prediction distribution.
+- ARL_0 ≈ 168 at default config is a reasonable detection-vs-false-
+  alarm trade-off for our use case (we refit calibration weekly at
+  most; one false alarm per ~168 races is fine).
+- The detector latches on first alarm (subsequent updates do not reset
+  alarmed_at). This is the right behaviour for the calling code: once
+  drift is detected, the operator refits and explicitly calls
+  `reset()` to start a new monitoring epoch.
+- A `direction` field on the state distinguishes "model under-predicts"
+  (label > pred in expectation, direction='high') from
+  "model over-predicts" (direction='low'). Both are diagnostically
+  useful even if the response is the same (refit).
+
+**Rejected Alternatives:**
+- Raw residual CUSUM with carefully-tuned defaults — rejected.
+  Initial attempt with k=0.025, h=2.0 false-alarmed at step 22 on a
+  perfectly-calibrated 1000-obs stream. Any defaults that work for
+  the well-calibrated case fail on the drifted case, because the
+  detection signal magnitude is conflated with the prediction
+  magnitude.
+- EWMA of residuals + z-test alarm — rejected (no change-point
+  awareness; once the model drifts the cumulative residual lingers
+  forever, masking subsequent recoveries).
+- Likelihood-ratio CUSUM (e.g. Wald SPRT) — rejected for v1.
+  Requires an explicit "alternative" calibration distribution; we don't
+  have a parameterised alternative model (drift could go any direction).
+  Worth revisiting if we ever want to detect specific failure modes
+  (e.g. "longshot bias growing").
+
+---
+
+## ADR-037: Calibrator Auto-Selector Uses Held-Out Inner-Val ECE (Supersedes ADR-030)
+
+**Date:** 2026-05-12
+**Status:** Accepted (supersedes ADR-030's "fit-slice ECE" criterion)
+
+**Context:**
+ADR-008 chose Platt-vs-isotonic auto-selection. ADR-030 (provisional)
+implemented selection by ECE on the FIT SLICE itself — the same data
+the calibrators were fit on. Isotonic regression has enough flexibility
+to memorise the fit slice (post-fit ECE ≈ 1e-18 on every dataset), so
+the fit-slice criterion always picks isotonic regardless of whether
+isotonic actually generalises.
+
+The full-parquet validate_calibration run (session 2026-05-12 f)
+exposed the failure: both Speed/Form and Meta-learner were ALREADY
+well-calibrated raw (test-slice ECE ≈ 0.003), the auto-selector picked
+isotonic anyway, and applying isotonic slightly DEGRADED test ECE
+(→ 0.005–0.006). On this dataset Platt would have been the right
+choice — but the fit-slice criterion could not see that.
+
+**Decision:**
+`Calibrator.fit` under `method='auto'` does an internal split of the
+fit slice (default 20% inner-val, seeded random shuffle), fits Platt
+and isotonic on the inner-train slice, computes ECE on the inner-val
+slice for each, and chooses based on inner-val ECE with a protective
+bias toward Platt:
+
+    chosen = isotonic if iso_val_ece + auto_min_delta_ece < platt_val_ece
+             else platt
+
+Defaults: `auto_val_fraction = 0.20`, `auto_min_delta_ece = 0.001`
+(isotonic must beat Platt by ≥ 0.1% ECE), `auto_min_inner_val_size = 100`
+(fall back to fit-slice ECE when the calib slice is too small for a
+reliable inner-val estimate).
+
+Both calibrators are STILL re-fit on the full calib slice after
+selection so no data is wasted. The metadata persists both:
+- `metrics`: fit-slice ECE/Brier/log-loss for both methods (diagnostic).
+- `inner_val_metrics`: held-out ECE for both methods (drives the choice).
+- `auto_selection_mode`: "held_out" or "fit_slice_fallback".
+
+**Rationale:**
+- Held-out ECE is the only valid generalisation criterion for choosing
+  between calibrator flexibility levels. Fit-slice ECE is conceptually
+  the same mistake as choosing model hyperparameters by training loss.
+- The 20% inner-val fraction is large enough to keep variance on the
+  ECE estimate low (at 200k+ calib rows, that's 40k val rows, ECE SE
+  well below 0.001) and small enough that the inner-train slice
+  still produces a representative calibrator.
+- The 0.001 `min_delta_ece` introduces a one-sided protective bias
+  toward the simpler model (Platt). On data where Platt and isotonic
+  are statistically indistinguishable, picking Platt is the more
+  conservative, more interpretable choice — and isotonic's
+  flexibility advantage hasn't manifested in held-out evidence.
+- The fit-slice fallback is necessary for unit tests and small
+  research datasets (calib < 500 rows). Inner-val ECE on < 100 rows
+  is too noisy to drive method selection.
+- A time-based inner split was rejected in favour of random shuffle:
+  time-isolation is enforced at the OUTER 3-way split (the calib slice
+  is itself a contiguous time window between train_cutoff and
+  test_cutoff). Choosing between two 1-D calibration maps does not
+  require additional within-slice time isolation; random shuffle
+  produces a more uniform validation distribution.
+
+**Empirical Validation:**
+The full-parquet re-run (session 2026-05-12 f, post-fix) will show
+whether the held-out criterion picks Platt on this dataset. If yes
+(expected), `auto_selection_mode='held_out'`, `chosen_method='platt'`,
+and test ECE remains in the 0.003-0.005 range. If isotonic still
+wins on held-out (unexpected), the finding is real (the dataset has
+non-sigmoidal distortion that survives held-out evaluation) and
+we should investigate per-jurisdiction calibration.
+
+**Rejected Alternatives:**
+- K-fold cross-validation within the fit slice — rejected for v1
+  (cleaner statistical estimate but K× the fit cost; the simple
+  inner-val gives well-bounded ECE estimates at our sample sizes,
+  ECE SE ≪ 0.001 at 40k val rows).
+- Default to Platt unconditionally; only allow isotonic via explicit
+  `method='isotonic'` — rejected. The staircase / strongly-distorted
+  case is real (early-phase models, miscalibrated by design), and
+  the auto-selector should be able to switch when held-out evidence
+  is unambiguous. The `min_delta_ece` knob captures this preference
+  without making the choice unidirectional.
+- Block bootstrap by race_id inside the calib slice — rejected for v1
+  (within-race outcomes ARE correlated, so race-aware bootstrap is
+  the theoretically clean inner-val; but at 200k calib rows /
+  ~17k races, the IID-with-race assumption is already mild and the
+  added complexity isn't worth it for an automated selection knob).
+
