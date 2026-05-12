@@ -34,7 +34,7 @@ log = structlog.get_logger(__name__)
 
 # Lifted verbatim from DATA_PIPELINE.md §12. Parametrized for score and
 # field_size only — column selection is fixed contract for downstream models.
-TRAINING_QUERY = """
+TRAINING_QUERY_TEMPLATE = """
 SELECT
     r.race_date,
     r.track_code,
@@ -73,6 +73,7 @@ LEFT JOIN trainers t ON rr.trainer_id = t.id
 WHERE rr.data_quality_score >= ?
   AND COALESCE(r.field_size, ?) >= ?
   AND rr.finish_position IS NOT NULL
+  {jurisdiction_filter}
 ORDER BY r.race_date ASC, r.track_code, r.race_number, rr.post_position;
 """
 
@@ -82,21 +83,35 @@ def export(
     output_path: Path,
     min_score: float = ROW_MIN_SCORE,
     min_field_size: int = 4,
+    jurisdictions: list[str] | None = None,
 ) -> dict:
     """Export training DataFrame as parquet. Returns a summary dict.
 
     Note: COALESCE(field_size, min_field_size) — if a source dataset didn't
     populate field_size we don't want to drop those rows; we trust them to
     pass the filter. ML training can re-derive field_size from group counts.
+
+    `jurisdictions` is an allow-list. AR is excluded by default callers (CLI
+    default is None = all) because of the known race-fragmentation issue
+    documented in PROGRESS.md (avg 2.2 horses/race; nro reused across venues).
     """
     if not db_path.exists():
         raise FileNotFoundError(f"DB not found: {db_path}")
 
+    params: list = [min_score, min_field_size, min_field_size]
+    if jurisdictions:
+        placeholders = ",".join("?" * len(jurisdictions))
+        jurisdiction_filter = f"AND r.jurisdiction IN ({placeholders})"
+        params.extend(jurisdictions)
+    else:
+        jurisdiction_filter = ""
+    query = TRAINING_QUERY_TEMPLATE.format(jurisdiction_filter=jurisdiction_filter)
+
     conn = sqlite3.connect(db_path)
     try:
         df = pd.read_sql_query(
-            TRAINING_QUERY, conn,
-            params=(min_score, min_field_size, min_field_size),
+            query, conn,
+            params=tuple(params),
             parse_dates=["race_date"],
         )
     finally:
@@ -111,6 +126,7 @@ def export(
         "rows_exported":   int(len(df)),
         "min_score":       min_score,
         "min_field_size":  min_field_size,
+        "jurisdictions":   jurisdictions or "ALL",
         "date_range":      [
             df["race_date"].min().date().isoformat() if len(df) else None,
             df["race_date"].max().date().isoformat() if len(df) else None,
@@ -118,6 +134,7 @@ def export(
         "unique_horses":   int(df["horse_name"].nunique()) if "horse_name" in df.columns else 0,
         "unique_races":    int(df.groupby(["race_date", "track_code", "race_number"]).ngroups)
                             if len(df) else 0,
+        "by_jurisdiction": df["jurisdiction"].value_counts().to_dict() if len(df) else {},
     }
     log.info("export.complete", **summary)
     return summary
@@ -139,17 +156,26 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                         help=f"Minimum data_quality_score (default: {ROW_MIN_SCORE})")
     parser.add_argument("--min-field-size", type=int, default=4,
                         help="Minimum field_size to include (default: 4)")
+    parser.add_argument("--jurisdictions", type=str, default=None,
+                        help="Comma-separated allow-list (e.g. 'UK,HK,JP'). "
+                             "Default: all. Recommended: exclude AR until the "
+                             "race-fragmentation issue is fixed (see PROGRESS.md).")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv or sys.argv[1:])
     output_path = args.output or _default_output()
+    jurisdictions = (
+        [j.strip().upper() for j in args.jurisdictions.split(",") if j.strip()]
+        if args.jurisdictions else None
+    )
     summary = export(
         db_path=args.db_path,
         output_path=output_path,
         min_score=args.min_score,
         min_field_size=args.min_field_size,
+        jurisdictions=jurisdictions,
     )
     print(json.dumps(summary, indent=2, default=str))
     return 0 if summary["rows_exported"] > 0 else 1

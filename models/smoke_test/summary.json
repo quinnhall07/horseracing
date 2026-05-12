@@ -1,0 +1,45 @@
+{
+  "input": "data\\exports\\training_20260512.parquet",
+  "output_dir": "models\\smoke_test",
+  "rows_total": 46346,
+  "rows_train": 41723,
+  "rows_val": 4623,
+  "split_date": "2018-02-25",
+  "models": {
+    "speed_form": {
+      "path": "models\\smoke_test\\speed_form",
+      "metrics": {
+        "train_log_loss": 0.2867957582213025,
+        "val_log_loss": 0.28701759475114497,
+        "train_auc": 0.6639025670067799,
+        "val_auc": 0.5843977646641282,
+        "val_race_top1_accuracy": 0.9134860050890585,
+        "n_train": 41723,
+        "n_val": 4623,
+        "n_features": 24
+      }
+    },
+    "pace_scenario": {
+      "trainable": false,
+      "stub": true
+    },
+    "sequence": {
+      "trainable": false,
+      "stub": true
+    },
+    "connections": {
+      "path": "models\\smoke_test\\connections",
+      "n_jockeys": 742,
+      "n_trainers": 731,
+      "n_pairs": 1489
+    },
+    "market": {
+      "path": "models\\smoke_test\\market"
+    },
+    "meta_learner": {
+      "path": "models\\smoke_test\\meta_learner"
+    }
+  },
+  "meta_val_log_loss": 0.2814469307229067,
+  "meta_val_top1_acc": 0.9389312977099237
+}

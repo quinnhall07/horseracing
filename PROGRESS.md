@@ -7,13 +7,304 @@ Format: newest session at the top.
 
 ## Current State
 
-**Phase:** 0 — Master Training Database (**LOADED**) + Phase 1 — PDF Ingestion (paused at scaffolding milestone)
-**Last completed task:** Master DB populated with **2,626,284 race results** across 336,967 races, 263,209 horses, 4 jurisdictions (UK / HK / JP / AR), 1986-2023. Zero duplicate dedup keys across every deduped table. ~80% of rows scored 0.85-0.95 at quality gate.
-**Next task:** Export ML training parquet (`python scripts/db/export_training_data.py`), recommended with jurisdiction filter excluding AR until the AR splitting issue is addressed. Then bootstrap Phase 3 (`backend/scripts/bootstrap_models.py`) to train baseline Speed/Form LightGBM. After that: resume Phase 1 bootstrap (`app/core/logging.py`, `app/main.py`, `app/api/v1/ingest.py`).
+**Phase:** 0 — Master Training DB **LOADED + EXPORTED** · Phase 1 — PDF Ingestion **COMPLETE** · Phase 2 — Feature Engineering **COMPLETE** · Phase 3 — Baseline Models **COMPLETE (Speed/Form + Connections + Market + Meta) · Pace/Sequence stubs**
+**Last completed task:** Trained the Phase-3 baseline model stack on the full 2,317,297-row training parquet. **Speed/Form** (LightGBM, 24 features) hit `val_auc=0.745`, `val_race_top1_acc=0.257` (vs ~0.083 random for ~12-horse fields). **Meta-learner** (LightGBM stacker over orthogonalised sub-model outputs) hit `val_log_loss=0.237`, `val_race_top1_acc=0.341` — 34% winner-pick rate on a held-out 10% time-slice (2018-02-19 → 2021-07-31). Connections model fit 2,291 jockey + 2,719 trainer + 50,251 pair shrunken rates. Artifacts at `models/baseline_full/`. **343 tests passing** (was 306 → +37 new: 15 training_data + 10 speed_form + 7 connections + 5 market).
+**Next task:** Phase 4 — calibration. Wrap `SpeedFormModel.predict_proba` (and the meta-learner output) in `app/services/calibration/calibrator.py` with Platt / isotonic selectors fit on a held-out slice. Build the reliability diagram + ECE report in `scripts/validate_calibration.py`. Then start Plackett-Luce MLE in `app/services/ordering/plackett_luce.py`.
+
+### Known Export Caveats (for Phase 3 model training)
+
+Column null rates in `training_20260512.parquet`:
+
+| Column                                                                                          | % rows null | Cause                                                       |
+|-------------------------------------------------------------------------------------------------|------------:|-------------------------------------------------------------|
+| `claiming_price`, `speed_figure_source`, `beaten_lengths_q1/q2`, `fraction_q1_sec/q2_sec`, `sire`, `dam_sire`, `foaling_year` | **100%**    | Not populated by any current source dataset.                |
+| `field_size`                                                                                    | 74%         | Only UK populates it. JP/HK NULL — derive via group counts. |
+| `speed_figure`                                                                                  | 72%         | JP has zero speed figures (1.6M rows). UK has 96%, HK 73%.  |
+| `post_position`                                                                                 | 26%         | All 598,708 UK rows. sheikhbarabas dataset omits it.        |
+| `purse_usd`                                                                                     | 1.5%        | Sparse on some HK/JP rows.                                  |
+| `fraction_finish_sec`                                                                           | 1.3%        | Sparse.                                                     |
+
+UK `race_number` is a **post-time-minutes-past-midnight proxy** from `time_string_to_minutes` — within-card ordering works (sorts by post time) but won't be a contiguous 1..N sequence. Phase 3 should recompute a 1..N race number per `(track_code, race_date)` group if needed.
+
+JP carries 1.6M rows with no speed figure. Either derive a synthetic speed figure from `(distance_furlongs, fraction_finish_sec, condition)` for JP, or restrict speed-figure-dependent models to UK+HK and rely on other features for JP.
 
 ---
 
 ## Session Log
+
+### Session: 2026-05-12 (d) — Phase 3 baseline model stack trained
+
+**Completed:**
+
+*Sub-model framework (all under `app/services/models/`)*
+- `training_data.py` — leakage-free feature prep. `groupby('horse_key').shift(1)`
+  precedes every per-horse rolling aggregate (`ewm_speed_prior`, `last_speed_prior`,
+  `best_speed_prior`, `mean_speed_prior`, `speed_delta_prior`, `mean_finish_pos_prior`,
+  `win_rate_prior`, `mean_purse_prior`, `days_since_prev`, `layoff_fitness`). EWM
+  uses `alpha=0.4` (CLAUDE.md §8). Adds field-relative columns
+  (`ewm_speed_zscore`, `ewm_speed_rank`, `ewm_speed_pct`, `weight_lbs_delta`) and
+  derives `field_size` from in-frame group counts when the source column is NULL
+  (which is 74% of the parquet — see "Known Export Caveats"). Exposes
+  `time_based_split(df, val_fraction)` per CLAUDE.md §2's no-random-split rule.
+- `speed_form.py` — `SpeedFormModel` (Layer 1a). LightGBM binary classifier on
+  `win`. Per-race softmax over RAW scores (not sigmoided) for the in-race
+  probability distribution. Save/load round-trip via LightGBM's native text
+  format + a JSON metadata sidecar.
+- `connections.py` — `ConnectionsModel` (Layer 1d). Empirical-Bayes shrinkage
+  estimator (beta-binomial pseudo-count `α=30`) over per-jurisdiction baseline
+  → per-jockey → per-trainer → per-pair win rates. Inference falls back through
+  the hierarchy when a pair/jockey/trainer is OOV. JSON serialisation.
+- `market.py` — `MarketModel` (Layer 1e). Implied-prob from `odds_final` → in-race
+  normalised → isotonic-regression calibration over historical wins. NaN for
+  rows where `odds_final` is missing (caller decides fallback).
+- `pace_scenario.py` + `sequence.py` — placeholder classes returning constant
+  0.5 from `predict_proba`. Their `fit()` raises `NotImplementedError` until
+  unblock criteria are met (pace: fractional times in parquet; sequence:
+  PyTorch + globally-unique horse_id). Documented inline.
+- `meta_learner.py` — `MetaLearner` (Layer 2). LightGBM head over the 5 sub-model
+  outputs + meta features (`field_size`, `distance_furlongs`).
+  Orthogonalisation (CLAUDE.md §2): every sub-model column except the
+  anchor (`speed_form_proba`) is replaced with its residual after linear
+  regression on the anchor. Cleanly separates "what the anchor already
+  knows" from each layer's marginal contribution.
+
+*Bootstrap orchestrator*
+- `scripts/bootstrap_models.py` — end-to-end: load parquet → prepare features →
+  time-split → fit Speed/Form + Connections + Market → stack predictions →
+  fit MetaLearner → persist artifacts + summary JSON. Supports
+  `--sample-frac` for smoke tests, `--run-name` for reproducible run dirs.
+
+*Tests*
+- `tests/test_models/_synth.py` — synthetic data generator producing a 480-row
+  fixture where `speed_figure` predicts `finish_position` (with noise) so trained
+  models have real signal to learn.
+- `tests/test_models/test_training_data.py` (15 tests) — no-leakage invariant,
+  field-size derivation, EWM math sanity, categorical dtype, time-split
+  boundaries, parquet round-trip.
+- `tests/test_models/test_speed_form.py` (10 tests) — fit/predict shape,
+  val_top1_acc > random, softmax sum-to-one per race, numerically-stable softmax
+  on large inputs, save/load round-trip with identical predictions.
+- `tests/test_models/test_connections.py` (7 tests) — predict shape, OOV
+  fallback to jurisdiction baseline, shrinkage bounded in [0, 1], save/load.
+- `tests/test_models/test_market.py` (5 tests) — implied-prob math,
+  non-positive odds → NaN, missing-odds rows → NaN predictions.
+
+*Live bootstrap run on full 2.3M-row parquet*
+
+| Model         | Train log loss | Val log loss | Val AUC | Val race top-1 |
+|---------------|---------------:|-------------:|--------:|---------------:|
+| Speed/Form    | 0.254          | 0.262        | 0.745   | **0.257**       |
+| Meta-learner  | —              | **0.237**    | —       | **0.341**       |
+
+Field size ≈ 12 horses on average, so random pick ≈ 0.083. Meta-learner is
+**~4× better than random** at picking the winner. Stacking provided a
+meaningful lift over Speed/Form alone (top-1 0.257 → 0.341, log-loss 0.262 → 0.237) —
+the orthogonalised connections + market columns carry real information.
+
+Artifacts persisted at `models/baseline_full/`:
+  speed_form/{booster.txt, metadata.json}
+  connections/model.json (2,291 jockeys / 2,719 trainers / 50,251 pairs)
+  market/model.json
+  meta_learner/{booster.txt, metadata.json}
+  summary.json
+
+**Bug fixes (during test authoring):**
+- The naive cross-row AUC assertion on synthetic data was misleading — speed
+  figures vary widely across small synthetic races, so cross-race AUC is
+  near-chance even when the model perfectly identifies WITHIN-race winners.
+  Test swapped to `val_race_top1_accuracy > 0.40`, which is the metric that
+  actually matters for the wagering use case.
+- Shrunken rate boundary test was too strict (`0 < v < 1`): when both the
+  observed sample and the prior are uniform-1.0, the posterior mean can
+  legitimately touch the boundary. Relaxed to `0 <= v <= 1` and added a
+  separate "average rate close to jurisdiction baseline" check that actually
+  exercises the shrinkage strength.
+
+**Key Decisions Made:**
+- **Softmax operates on raw LightGBM scores, not sigmoided probabilities.**
+  Sigmoid-then-renormalise double-squashes the dynamic range and destroys the
+  signal at the tails (longshots and chalk). Raw-score softmax preserves the
+  additive structure the model learned and produces a calibratable
+  distribution. Phase 4 calibration sits on top.
+- **Orthogonalisation lives in the meta-learner module, not the sub-models.**
+  Each sub-model emits its raw output. The stacker decides what's orthogonal to
+  what — keeps the sub-models composable and lets us swap in a different
+  meta-learner (logistic regression, MLP) without touching Layer 1.
+- **Pace and Sequence are deferred via STUB classes returning 0.5.** Without
+  the fractional time columns (Pace) or PyTorch + a globally-unique horse_id
+  (Sequence), training them now would be busywork. The meta-learner is robust
+  to constant features (the orthogonalisation step zeros them out), so wiring
+  the slots in advance lets us drop trained models in without touching the
+  orchestrator.
+- **Horse grouping key is `(horse_name, jurisdiction)`.** Not perfect — name
+  collisions across years exist — but it's the most informative key the parquet
+  exposes. The cleaner fix is to surface `horses.dedup_key` in
+  `export_training_data.py`; deferred to a future export.
+- **Connections shrinkage prior strength = 30.** Empirically chosen — pulls
+  small-sample jockey/trainer rates toward jurisdiction baseline strongly
+  enough that 1-of-1 windfalls don't propagate, but lets veteran jockeys
+  with hundreds of starts express their true rate. Tunable via config.
+
+**Known limitations carried forward:**
+- Pace / Sequence layers untrained — contributing 0.5 to the stacker (zeroed
+  out after orthogonalisation, so no harm done, but the meta is missing
+  potentially valuable signal).
+- AR exclusion stands. Jurisdiction values are limited to {UK, HK, JP}.
+- No calibration yet — `predict_proba` outputs are NOT calibrated; using them
+  for EV calculation would be wrong. That's the Phase 4 deliverable.
+- `field_size` derivation runs after the parquet load (groupby in
+  `prepare_training_features`). This is correct for training but the live
+  ingest path must populate the column from the parsed RaceCard itself —
+  noted, not blocking.
+
+**Tests Status:**
+- **343 tests passing in ~9s** (was 306 → +37 new). Run with
+  `.venv/Scripts/python.exe -m pytest tests/ -q`.
+
+---
+
+### Session: 2026-05-12 (c) — Phase 0/1/2 closeout sweep
+
+**Completed:**
+
+*Phase 0 (loose-end cleanup)*
+- `scripts/db/backfill_tracks.py` — idempotent populator for the previously-empty
+  `tracks` table. Derives one row per `(track_code, jurisdiction)` from `races` and
+  records the union of surfaces observed at each track as a JSON array. Ran live:
+  100 distinct combos inserted. Re-running is a no-op (UNIQUE constraint).
+- `tests/test_db/test_backfill_tracks.py` (3 tests) — happy path, idempotency,
+  surface aggregation.
+
+*Phase 1 (closeout)*
+- `.env.example` — full HRBS_* knob template aligned with `app/core/config.py`.
+- `app/core/logging.py` — idempotent `configure_logging()` honouring `LOG_LEVEL`
+  and `LOG_JSON`. ConsoleRenderer (with colour when stdout is a TTY) in dev,
+  JSONRenderer in prod. `get_logger()` is the public helper.
+- `app/services/pdf_parser/equibase_parser.py` — `EquibaseParser(BrisnetParser)`.
+  Subclass placeholder; same regex layer for now. Extractor's `_get_parser()` now
+  routes the `equibase` format to it (was falling back to BrisnetParser previously).
+- `app/db/session.py` — async SQLAlchemy 2.0 engine (`AsyncEngine`) + session
+  factory + `session_scope()` context manager + `get_session()` FastAPI dep +
+  `init_db()` / `dispose_engine()` lifespan hooks. Declarative `Base` lives here.
+- `app/db/models.py` — `IngestedCard`/`IngestedRace`/`IngestedHorse`/`IngestedPPLine`
+  ORM hierarchy with `cascade="all, delete-orphan"` so deleting a card cleanly
+  removes the whole tree. JSON columns for variable-length fields
+  (medication_flags, equipment_changes, parse_warnings).
+- `app/db/persistence.py` — `card_to_orm()` + `persist_ingestion_result()`. Splits
+  Pydantic-to-ORM conversion from HTTP handler logic for testability.
+- `app/main.py` — `create_app()` factory with async lifespan that boots logging
+  + `init_db()`. CORS allow-all (dev), `/healthz` + `/version`, mounts the
+  ingest router at `/api/v1/ingest`.
+- `app/api/v1/ingest.py` — POST `/upload`. Multipart PDF, content-type guard,
+  size guard at HTTP boundary, then `run_in_executor(ingest_pdf, ...)` so the
+  CPU-bound parser doesn't block the event loop. Successful results are
+  persisted via the SQLAlchemy session dependency; failures are returned to
+  the client with `processing_ms` populated.
+- `tests/test_api/test_ingest.py` (6 tests) — `/healthz`, `/version`, empty body
+  → 400, bad content-type → 415, corrupt PDF → success=False, valid reportlab-
+  drawn fixture → 200 + structured payload.
+- `pyproject.toml` — added FastAPI, uvicorn, python-multipart, SQLAlchemy 2.0,
+  aiosqlite, numpy to runtime deps; httpx to dev deps.
+
+*Phase 2 (full implementation)*
+- `app/services/feature_engineering/layoff.py` — `layoff_fitness(days)` returns a
+  [0,1] score; `apply_layoff_features(df)` writes the column. `DEFAULT_LAMBDA =
+  ln(2)/60` so fitness halves at `recovery_threshold + 60 days` (≈ 90-day layoff).
+  First-time starters mapped to the sentinel `FIRST_TIME_STARTER_FITNESS = 0.6`.
+  (12 tests)
+- `app/services/feature_engineering/speed_features.py` — EWM α=0.4 (CLAUDE.md §8;
+  pandas convention is most-recent-LAST, so we reverse the most-recent-first
+  PP list before `.ewm()`). Per-horse summary: `ewm_speed_figure`, `last_speed_figure`,
+  `best_speed_figure` (6-PP window), `speed_figure_delta`. Field-relative columns:
+  `ewm_speed_zscore`, `ewm_speed_rank` (1=fastest), `ewm_speed_pct`. Constant fields
+  z-score to 0 (no NaN). (13 tests)
+- `app/services/feature_engineering/pace_features.py` — `pace_shape_metrics(pp)`
+  builds `early_speed = -beaten_lengths_q1`, `late_kick = bl_q2 - bl_finish`,
+  fraction ratios. Per-horse `horse_pace_summary()` averages over the 5-PP
+  window. Field-level `pace_pressure_index` = count of horses whose mean
+  `beaten_lengths_q1 ≤ 1.5L` (front-runner proxy). (13 tests)
+- `app/services/feature_engineering/class_features.py` — claiming-to-claiming uses
+  claiming-price delta directly; otherwise falls back to purse delta. Records
+  `race_type_change` as `same` or `<modal>-><today>`. Field-relative z-score
+  appended. (8 tests)
+- `app/services/feature_engineering/connections.py` — jockey continuity proxies:
+  `today_jt_same_pair`, `jockey_repeat_streak`, `today_jockey_win_rate_in_pps`.
+  `trainer_continuity` is a weak proxy (no per-PP trainer field in the schema —
+  documented inline). Names normalized via casefold + strip. (8 tests)
+- `app/services/feature_engineering/engine.py` — `FeatureEngine.transform(card)`
+  produces a tidy long-form DataFrame keyed by `(race_number, post_position)`.
+  Joins all per-module frames + base identifiers + `weight_lbs_delta` (field-
+  relative). One bad race is logged + skipped without killing the card. (9 tests)
+- `tests/test_features/_fixtures.py` — shared synthetic-card factory used by
+  every feature test module. Centralises the construction of valid PPs / horses
+  / races / cards so test files stay focused on assertions.
+
+**Bug fixes (none — full clean closeout)**
+
+**Key Decisions Made:**
+- **Live ingestion DB is separate from master training DB.** The Pydantic schemas
+  in `app/schemas/race.py` model PDF-derived race cards (today's racing data).
+  The ORM in `app/db/models.py` mirrors that schema, NOT the master `race_results`
+  table. Two different stores: master DB is the training corpus at
+  `data/db/master.db`; the live DB defaults to `./horseracing.db` (overridable
+  via `HRBS_DATABASE_URL`). Keeping them isolated prevents schema collision and
+  lets ingest-time writes happen without locking read-heavy training queries.
+- **EquibaseParser is a thin subclass for now.** Without real Equibase PDFs to
+  test against, divergences from Brisnet are speculative — better to dispatch on
+  format (so behaviour is per-format from the start) than to fork the regex layer
+  prematurely. Future overrides go on the subclass.
+- **Layoff curve constants live in the module, not config.** `DEFAULT_LAMBDA` and
+  `DEFAULT_RECOVERY_THRESHOLD_DAYS` are pure tunables — Phase 3 will fit them
+  per-surface from the master DB and pass fitted values into the engine. No
+  global mutable state.
+- **EWM weighting direction is documented inline.** pandas' `.ewm(alpha)` weights
+  the LAST element heaviest; our `HorseEntry.pp_lines` is enforced most-recent-
+  FIRST. The module reverses before applying `.ewm()` and the docstring explains
+  why. Two places where the direction matters: `ewm_speed()` and any future
+  rolling stats.
+- **Trainer continuity is a documented weak proxy.** `PastPerformanceLine` carries
+  per-PP `jockey` but no per-PP `trainer` (the Brisnet PDF format itself omits
+  the per-PP trainer in the dense PP table; only today's trainer appears in the
+  horse header). The connections module returns a 0/1 proxy with the limitation
+  documented; the Bayesian connections model in Phase 3 will get richer trainer
+  context from the master training DB instead.
+
+**Tests Status:**
+- **306 tests passing in ~7s** (was 234 → +72 new). Run with
+  `.venv/Scripts/python.exe -m pytest tests/ -q`.
+
+---
+
+### Session: 2026-05-12 (b) — ML training parquet exported
+
+**Completed:**
+- Added `--jurisdictions UK,HK,JP` flag to `scripts/db/export_training_data.py`. Threaded as an
+  optional allow-list through to the SQL via parametrized `AND r.jurisdiction IN (?,...)` clause
+  appended to the existing `TRAINING_QUERY_TEMPLATE`. Default remains "all jurisdictions".
+- Ran the export. Output: `data/exports/training_20260512.parquet`. 2,317,297 rows × 29 columns,
+  38.9 MB. Date range 1986-01-05 → 2021-07-31. By jurisdiction: JP 1,609,930 / UK 598,708 / HK
+  108,659. Mean field size (derived from group counts) 11.67 horses/race — healthy and consistent
+  with real racing.
+- Updated PROGRESS.md "Current State" + added a "Known Export Caveats" table cataloguing the
+  null-rate gaps Phase 3 will need to handle.
+
+**Key Decisions Made:**
+- Excluded AR from the export per PROGRESS.md recommendation (avg 2.2 horses/race due to the
+  `nro`-reuse issue across same-day venues at the same track). Distance + surface in the dedup
+  key don't disambiguate enough to recover the true field. Including AR would teach models that
+  2-horse fields are common, which is false.
+- Did not regenerate `field_size` at export time — left it as raw column value (UK populated,
+  JP/HK NULL). Phase 3 can compute it via `df.groupby(['race_date','track_code','race_number']).size()`.
+  Pushing that derivation downstream keeps the export contract simple.
+- Did not attempt to derive a synthetic UK `post_position` or JP speed figure during export. Both
+  are Phase 3 concerns — they require modelling decisions (which feature engineering approach?
+  fall back vs. impute vs. exclude?) that belong in the bootstrap script, not in the SQL export.
+
+**Tests Status:**
+- 62 Phase 0 tests passing in 2.45s. No new tests added — the `--jurisdictions` flag is a thin
+  CLI passthrough; the SQL parameterization path is exercised end-to-end by the live export.
+
+---
 
 ### Session: 2026-05-12 — Bug-fix sweep + master DB populated (2.6M results loaded)
 
@@ -436,46 +727,66 @@ the column-presence evaluator.
 - [x] `tests/test_db/test_quality_gate.py` (21 tests)
 - [x] `tests/test_db/test_pipeline.py` (3 end-to-end tests)
 - [x] **Live run: master DB populated with 2.6M results across UK / HK / JP / AR (1986-2023)**
-- [ ] Export ML training parquet via `scripts/db/export_training_data.py` (recommend `--jurisdictions UK,HK,JP` until AR splitting fixed)
+- [x] **ML training parquet exported: `data/exports/training_20260512.parquet` (2.3M rows, UK+HK+JP)**
+- [x] `scripts/db/backfill_tracks.py` + tests — `tracks` table now holds 100 distinct (track_code, jurisdiction) combos
 - [ ] Future: derive a venue-specific course identifier for AR to fix the over-split races issue
-- [ ] Future: populate `tracks` table from existing `races` data (currently unused)
+- [ ] Future: derive JP synthetic speed figure from `(distance, fraction_finish_sec, condition)` so JP rows can train speed-dependent models
 
 ### Phase 1: PDF Ingestion
-- [ ] `app/core/config.py` — scaffold only; full BaseSettings present but logging/db settings unused yet
-- [ ] `app/core/logging.py`
-- [ ] `app/main.py`
-- [ ] `app/api/v1/ingest.py`
-- [ ] `app/db/models.py`
-- [ ] `app/db/session.py`
+- [x] `app/core/config.py`
+- [x] `app/core/logging.py`
+- [x] `app/main.py`
+- [x] `app/api/v1/ingest.py`
+- [x] `app/db/models.py`
+- [x] `app/db/session.py`
+- [x] `app/db/persistence.py`
 - [x] `app/schemas/race.py`
 - [x] `app/services/pdf_parser/cleaner.py`
 - [x] `app/services/pdf_parser/extractor.py`
 - [x] `app/services/pdf_parser/brisnet_parser.py`
-- [ ] `app/services/pdf_parser/equibase_parser.py` (stub → implementation)
+- [x] `app/services/pdf_parser/equibase_parser.py` (subclass placeholder)
 - [x] `tests/test_parser/test_cleaner.py` (102 tests)
 - [x] `tests/test_parser/test_brisnet_parser.py` (45 tests)
 - [x] `tests/test_parser/test_extractor.py` (25 tests)
+- [x] `tests/test_api/test_ingest.py` (6 tests)
 - [x] `pyproject.toml`
-- [ ] `backend/.env.example`
+- [x] `.env.example`
+- [ ] Future: real-PDF validation pass against an actual Brisnet UP card; tune `_RE_RACE_HEADER` (`\bRACE\b` anchor) and `extract_text_from_pdf` (real `layout=True` mode)
+- [ ] Future: DRF parser implementation (currently falls back to BrisnetParser)
 
 ### Phase 2: Feature Engineering
-- [ ] `app/services/feature_engineering/engine.py`
-- [ ] `app/services/feature_engineering/speed_features.py`
-- [ ] `app/services/feature_engineering/pace_features.py`
-- [ ] `app/services/feature_engineering/class_features.py`
-- [ ] `app/services/feature_engineering/connections.py`
-- [ ] `app/services/feature_engineering/layoff.py`
-- [ ] `tests/test_features/`
+- [x] `app/services/feature_engineering/engine.py` (FeatureEngine orchestrator)
+- [x] `app/services/feature_engineering/speed_features.py` (EWM α=0.4 + field-relative z/rank/pct)
+- [x] `app/services/feature_engineering/pace_features.py` (shape, fraction ratios, pressure index)
+- [x] `app/services/feature_engineering/class_features.py` (claiming/purse delta + race-type change)
+- [x] `app/services/feature_engineering/connections.py` (jockey continuity + win-rate proxy)
+- [x] `app/services/feature_engineering/layoff.py` (parametric exp-decay fitness curve)
+- [x] `tests/test_features/test_layoff.py` (12 tests)
+- [x] `tests/test_features/test_speed_features.py` (13 tests)
+- [x] `tests/test_features/test_pace_features.py` (13 tests)
+- [x] `tests/test_features/test_class_features.py` (8 tests)
+- [x] `tests/test_features/test_connections.py` (8 tests)
+- [x] `tests/test_features/test_engine.py` (9 integration tests)
+- [x] `tests/test_features/_fixtures.py` (shared synthetic-card builders)
 
 ### Phase 3: Model Layer
-- [ ] `scripts/bootstrap_models.py`
-- [ ] `app/services/models/speed_form.py`
-- [ ] `app/services/models/pace_scenario.py`
-- [ ] `app/services/models/sequence.py`
-- [ ] `app/services/models/connections.py`
-- [ ] `app/services/models/market.py`
-- [ ] `app/services/models/meta_learner.py`
-- [ ] `tests/test_models/`
+- [x] `scripts/bootstrap_models.py` (orchestrator with --sample-frac and --run-name)
+- [x] `app/services/models/training_data.py` (leakage-free feature prep + time split)
+- [x] `app/services/models/speed_form.py` (LightGBM Layer 1a — trained, val_top1=0.257)
+- [x] `app/services/models/pace_scenario.py` (STUB — needs fractional time columns)
+- [x] `app/services/models/sequence.py` (STUB — needs PyTorch + globally-unique horse_id)
+- [x] `app/services/models/connections.py` (Empirical-Bayes Layer 1d — trained, 50K pairs)
+- [x] `app/services/models/market.py` (Isotonic odds calibration Layer 1e — trained)
+- [x] `app/services/models/meta_learner.py` (LightGBM stacker — trained, val_top1=0.341)
+- [x] `tests/test_models/test_training_data.py` (15 tests)
+- [x] `tests/test_models/test_speed_form.py` (10 tests)
+- [x] `tests/test_models/test_connections.py` (7 tests)
+- [x] `tests/test_models/test_market.py` (5 tests)
+- [x] `tests/test_models/_synth.py` (shared synthetic data generator)
+- [x] **Live baseline trained: `models/baseline_full/` — Speed/Form val_top1=0.257, Meta val_top1=0.341**
+- [ ] Future: train pace_scenario once fractional times are in the parquet
+- [ ] Future: train sequence transformer once PyTorch + horse dedup_key in export
+- [ ] Future: expose `horses.dedup_key` in `export_training_data.py` to fix horse collisions
 
 ### Phase 4: Calibration + Ordering
 - [ ] `app/services/calibration/calibrator.py`

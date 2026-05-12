@@ -29,6 +29,7 @@ import structlog
 from app.core.config import settings
 from app.schemas.race import IngestionResult, RaceCard
 from app.services.pdf_parser.brisnet_parser import BrisnetParser
+from app.services.pdf_parser.equibase_parser import EquibaseParser
 
 logger = structlog.get_logger(__name__)
 
@@ -148,10 +149,11 @@ def _get_parser(fmt: str):
     """
     if fmt == "brisnet_up":
         return BrisnetParser()
-    # Stubs — will be replaced by format-specific parsers in later phases
-    if fmt in ("drf", "equibase"):
+    if fmt == "equibase":
+        return EquibaseParser()
+    if fmt == "drf":
         logger.warning(
-            "Format-specific parser not yet implemented; using Brisnet parser as fallback",
+            "DRF parser not yet implemented; using Brisnet parser as fallback",
             format=fmt,
         )
         return BrisnetParser()
