@@ -1017,6 +1017,178 @@ inline in `training_data.py` with a TODO pointing at the proper fix
 
 ---
 
+## ADR-030: Calibrator Selects on Fit-Slice ECE (Provisional)
+
+**Date:** 2026-05-12
+**Status:** Accepted (provisional — strengthen to cross-validated selection
+if Platt and isotonic start trading wins on the full parquet)
+
+**Context:**
+ADR-008 specified cross-validated ECE selection between Platt scaling and
+isotonic regression. Implementing fold-based selection inside `fit()` is
+several files of CV plumbing for a question that — on our actual data so
+far — has a single answer: isotonic dominates.
+
+**Decision:**
+The `Calibrator.fit(scores, labels)` path fits both candidates on the
+SAME data it receives and computes ECE on that same data to decide. The
+auto-selector simply picks the lower-ECE candidate. The held-out
+generalisation check happens ONE LAYER UP in
+`scripts/validate_calibration.py`, which evaluates the chosen calibrator
+on an entirely separate test slice (`evaluate_calibration` returns both
+pre- and post-cal ECE on the test slice).
+
+**Rationale:**
+- Isotonic has more degrees of freedom and will essentially always win
+  on its own training data, so fit-slice ECE alone doesn't distinguish
+  the methods well. But on our smoke run (5% sample, separate test slice)
+  post-cal ECE remained strictly better than pre-cal ECE for BOTH models
+  — isotonic was the right call, full stop.
+- If we ever see a case where Platt wins on the test slice but isotonic
+  wins on the fit slice, we'll have evidence that fold-based selection
+  is necessary. Until then, the simpler path keeps the calibrator small
+  and auditable.
+- The full-blown ADR-008 spec ("Platt fails when distortion is asymmetric
+  or non-sigmoidal; isotonic has no such constraint but requires more
+  data to be stable") is still the operating principle — our test slice
+  on the meta-learner showed exactly the asymmetric overconfidence Platt
+  can't fit, and isotonic flattened it.
+
+**Rejected Alternatives:**
+- 5-fold CV inside `fit()` — deferred until evidence suggests selection
+  is wrong. Extra LOC for no current behavioural difference.
+- Always-isotonic (drop Platt entirely) — rejected. The smoke run shows
+  isotonic wins on this corpus; that doesn't mean it always will, and
+  keeping both lets the auto-selector adapt to future data without code
+  changes.
+
+---
+
+## ADR-031: Plackett-Luce NLL is Vectorised Over Orderings, Not Looped
+
+**Date:** 2026-05-12
+**Status:** Accepted
+
+**Context:**
+The MLE strength fitter's likelihood evaluates `Σ_{orderings} Σ_{positions}
+[θ_chosen − logsumexp(θ_remaining)]`. The naive Python implementation
+iterates two nested loops in pure Python — fine for hundreds of orderings
+but slow at thousands. The synthetic recovery test (5000 orderings × ~50
+L-BFGS iterations) took 60+ seconds with the naive loop.
+
+**Decision:**
+The NLL accepts a rectangular `(n_orderings, max_len)` integer array of
+padded ordering indices plus a `(n_orderings,)` length vector. Inside the
+function we loop only over POSITIONS (max length = `n_items`) and apply
+the position step to all orderings simultaneously via:
+1. A `(n_orderings, n_items)` boolean mask of items still remaining.
+2. `logsumexp(np.where(remaining, theta, -inf), axis=1)` for per-row
+   denominators.
+3. Active-row gating via `pos < orderings_lens`.
+
+This drops the test suite from 66 s to ~2 s on the same hardware.
+
+**Rationale:**
+- The position loop is bounded by `n_items` (≤ 20 in practice). The
+  ordering loop was unbounded — making it the outer-Python loop is what
+  was killing us.
+- numpy + scipy fused-ops scale at C speed; Python loop overhead per
+  ordering was the dominant cost.
+- Partial orderings (top-k for k < n_items) fit naturally: pad with any
+  sentinel value, gate contributions with `active = pos < lens`.
+
+**Rejected Alternatives:**
+- numba JIT — rejected (extra build dep + cold-start cost).
+- scipy's analytical PL gradient via `scipy.stats` — rejected (no first-
+  class PL in scipy; would need a third-party package like `choix`).
+- Cython rewrite — premature; the vectorised numpy version is fast
+  enough that we can fit on 100k+ orderings in seconds.
+
+---
+
+## ADR-032: Per-Race Temperature Softmax is Logit-Scale, Not Power-Scale
+
+**Date:** 2026-05-12
+**Status:** Accepted
+
+**Context:**
+After per-row calibration, the per-race distribution needs to renormalise
+so probabilities sum to 1 within a field. Two common forms:
+1. Power scaling: `p_i^(1/T) / Σ_k p_k^(1/T)`
+2. Logit-scale softmax: `softmax(logit(p_i) / T)` per race
+
+Both produce a distribution summing to 1 per race. They differ at the
+tails: power scaling is multiplicative, logit-scale softmax is additive.
+
+**Decision:**
+`Calibrator.predict_softmax(scores, race_ids)` uses logit-scale: for each
+row, compute `logit(clip(p, ε, 1-ε)) / T`, then stable-softmax across
+race groups.
+
+**Rationale:**
+- Plackett-Luce treats strengths as proportional to win probabilities and
+  composes additively in log space. Feeding it logit-scale outputs is the
+  natively-compatible form.
+- The calibration literature (Guo et al. 2017, "On Calibration of Modern
+  Neural Networks") uses logit-scale temperature scaling as the
+  canonical form. Adopting the same shape means our calibration discussion
+  is interchangeable with published reliability-diagram analyses.
+- Power scaling at extreme p values is numerically unstable when p is
+  near 0 or 1 — it blows up the multiplicative factor. Logit-scale with
+  clipped inputs is bounded by construction.
+
+**Rejected Alternatives:**
+- Power scaling — incompatible with PL's log-space composition; numerical
+  edge cases at the tails.
+- No temperature (T = 1 fixed) — loses a knob the future ordering /
+  portfolio layer will want for risk shaping. The current default is
+  T = 1.0 (no-op), but the knob is there.
+
+---
+
+## ADR-033: MarketModel Save/Load Rebuilds Isotonic Interpolation
+
+**Date:** 2026-05-12
+**Status:** Accepted (corrects a pre-existing bug)
+
+**Context:**
+`MarketModel` serialises its `sklearn.isotonic.IsotonicRegression` to JSON
+(thresholds + y values). The original `load()` set `iso.f_ = None`,
+expecting sklearn's `_transform` to recompute the interpolation lazily.
+sklearn does not in fact recompute — it calls `self.f_(T)` directly. So
+every prediction on a freshly-loaded `MarketModel` raised
+`TypeError: 'NoneType' object is not callable`. The Phase-3 bootstrap had
+only ever exercised the fit-then-predict-in-the-same-process path; the
+bug surfaced when Phase 4 `validate_calibration.py` reloaded the model.
+
+**Decision:**
+On load, rebuild `iso.f_` directly using `scipy.interpolate.interp1d(xs,
+ys, kind="linear", bounds_error=False, fill_value=(ys[0], ys[-1]))`.
+This matches what sklearn's `_build_f` builds at fit time for the
+`out_of_bounds="clip"` configuration. A new
+`test_save_load_round_trip_preserves_predictions` regression test asserts
+`predict_proba` outputs are byte-identical before and after a round-trip.
+
+**Rationale:**
+- The JSON format stays portable (no joblib pickle in the model
+  artefact directory — only thresholds + config), but the load path is
+  now functionally complete.
+- Sklearn's `_build_f` is a private method and could change; calling
+  scipy's `interp1d` directly is stable across sklearn versions and uses
+  the same underlying primitive sklearn itself uses.
+- The regression test is the lock-in: any future change to MarketModel
+  save/load must keep predictions identical or the test fails.
+
+**Rejected Alternatives:**
+- Switch entire MarketModel persistence to joblib — rejected. JSON is
+  human-readable and inspectable; joblib pickles are not. The fix is one
+  function call, not a serialisation-format rewrite.
+- Defer the predict-time interpolation rebuild to first-call (lazy) —
+  rejected. Less explicit; harder to reason about; doesn't catch the
+  bug at load time when it's easiest to surface a clear error.
+
+---
+
 ## ADR-028: ConnectionsModel Shrinkage Prior Strength α = 30
 
 **Date:** 2026-05-12

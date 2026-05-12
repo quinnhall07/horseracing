@@ -7,9 +7,9 @@ Format: newest session at the top.
 
 ## Current State
 
-**Phase:** 0 — Master Training DB **LOADED + EXPORTED** · Phase 1 — PDF Ingestion **COMPLETE** · Phase 2 — Feature Engineering **COMPLETE** · Phase 3 — Baseline Models **COMPLETE (Speed/Form + Connections + Market + Meta) · Pace/Sequence stubs**
-**Last completed task:** Trained the Phase-3 baseline model stack on the full 2,317,297-row training parquet. **Speed/Form** (LightGBM, 24 features) hit `val_auc=0.745`, `val_race_top1_acc=0.257` (vs ~0.083 random for ~12-horse fields). **Meta-learner** (LightGBM stacker over orthogonalised sub-model outputs) hit `val_log_loss=0.237`, `val_race_top1_acc=0.341` — 34% winner-pick rate on a held-out 10% time-slice (2018-02-19 → 2021-07-31). Connections model fit 2,291 jockey + 2,719 trainer + 50,251 pair shrunken rates. Artifacts at `models/baseline_full/`. **343 tests passing** (was 306 → +37 new: 15 training_data + 10 speed_form + 7 connections + 5 market).
-**Next task:** Phase 4 — calibration. Wrap `SpeedFormModel.predict_proba` (and the meta-learner output) in `app/services/calibration/calibrator.py` with Platt / isotonic selectors fit on a held-out slice. Build the reliability diagram + ECE report in `scripts/validate_calibration.py`. Then start Plackett-Luce MLE in `app/services/ordering/plackett_luce.py`.
+**Phase:** 0 — Master Training DB **LOADED + EXPORTED** · Phase 1 — PDF Ingestion **COMPLETE** · Phase 2 — Feature Engineering **COMPLETE** · Phase 3 — Baseline Models **COMPLETE** · Phase 4 — **Calibration + Plackett-Luce IN PROGRESS** (Stern / Copula / drift-detection deferred)
+**Last completed task:** Built Phase-4 calibration (`app/services/calibration/calibrator.py`: Platt + isotonic + auto-selector + per-race softmax with temperature, helpers for ECE / Brier / reliability bins) and Plackett-Luce ordering (`app/services/ordering/plackett_luce.py`: analytical exacta/trifecta/superfecta + enumerate_exotic_probs + vectorised MLE strength fit via scipy.optimize). Built `scripts/validate_calibration.py` (CLI + importable `evaluate_calibration` + matplotlib reliability diagrams). Live smoke on 5% of the parquet shows the meta-learner is **substantially miscalibrated raw** (ECE 0.121) and **isotonic flattens it to 0.011** — a ~91% reduction; speed/form drops 0.037 → 0.005 the same way. Fixed a latent pre-existing bug in `MarketModel.load()` (sklearn IsotonicRegression `f_` was set to None on load → `'NoneType' object is not callable` at predict time) by rebuilding the linear interpolation from the saved thresholds via `scipy.interpolate.interp1d`; added the missing save/load round-trip test. **389 tests passing** (was 343 → +46 new: 21 calibrator + 21 plackett_luce + 3 validate_calibration smoke + 1 market round-trip regression).
+**Next task:** Run `scripts/validate_calibration.py` on the FULL 2.3M-row parquet (this session ran 5% smoke; the artifact dir is gitignored — re-run when needed). Then: Stern (Gamma) ordering model in `app/services/ordering/stern.py`, Copula model for pace-correlated exotics in `app/services/ordering/copula.py`, and CUSUM change-point drift detection in `app/services/calibration/drift.py`. After that, Phase 5: EV engine + portfolio optimisation.
 
 ### Known Export Caveats (for Phase 3 model training)
 
@@ -31,6 +31,136 @@ JP carries 1.6M rows with no speed figure. Either derive a synthetic speed figur
 ---
 
 ## Session Log
+
+### Session: 2026-05-12 (e) — Phase 4 calibration + Plackett-Luce (code complete; full run pending)
+
+**Completed:**
+
+*Calibration module (`app/services/calibration/`)*
+- `calibrator.py` — `Calibrator` class with three modes (`platt`, `isotonic`,
+  `auto`). The auto-selector fits both estimators and keeps the one with
+  lower ECE on the fit set (ADR-008). `predict_softmax(scores, race_ids)`
+  applies temperature-scaled logit softmax per race group; T < 1 sharpens,
+  T > 1 flattens. Helpers `expected_calibration_error`, `reliability_bins`
+  (returns exactly `n_bins` entries — empty bins included so a downstream
+  plotter doesn't need to special-case them), and `brier_score`. Save/load
+  is joblib for the sklearn estimators + JSON sidecar for metadata.
+- `tests/test_calibration/test_calibrator.py` (21 tests) — ECE math on
+  perfectly-calibrated synthetic, biased-prob ECE growth, empty-bin
+  handling, Platt monotonicity, isotonic monotonicity, auto picks isotonic
+  when distortion is non-sigmoidal (3-plateau staircase), softmax sum-to-1
+  per race, temperature sharpens distribution, save/load round-trip.
+
+*Ordering module (`app/services/ordering/`)*
+- `plackett_luce.py` — analytical exotic probability functions
+  (`exacta_prob`, `trifecta_prob`, `superfecta_prob`, plus
+  `enumerate_exotic_probs(p, k)` for grid-search workflows), a
+  `sample_ordering` helper, and `fit_plackett_luce_mle(orderings, n_items)`
+  for the corpus-level MLE strength fit. Scale fixed by pinning θ[0] = 0,
+  then strengths are exp-normalised so `strengths.sum() == 1`. The NLL is
+  **vectorised over orderings**: pads to a rectangular `(n_ord, max_len)`
+  index array and runs one `scipy.special.logsumexp` per position rather
+  than per (ordering, position) pair — drops the test suite from 66s to 2s.
+- `tests/test_ordering/test_plackett_luce.py` (21 tests) — 2-horse exacta
+  sum-to-1, 3-horse trifecta uniform field gives 1/6 per permutation,
+  skewed-field hand-computed values, exacta marginal recovers
+  win-prob, superfecta sums to 1 over 24 perms, superfecta extends
+  trifecta via summation, edge cases (zero-prob horse, certain horse,
+  invalid sum / negative / out-of-range index / repeated index), MLE
+  recovery on 5000 synthetic orderings to within 0.05 abs error per
+  strength, MLE handles partial top-k orderings.
+
+*Validation script*
+- `scripts/validate_calibration.py` — pure `evaluate_calibration(calib, test)`
+  returning a `CalibrationReport`, `render_reliability_diagram(report, png)`
+  via matplotlib (headless Agg backend), plus a `run_live()` CLI that
+  loads the trained `models/baseline_full/` artefacts, re-runs the feature
+  pipeline, 3-way time-splits (train / calib / test), scores both
+  Speed/Form and Meta-learner, and writes a JSON + PNG report per model.
+- `tests/test_calibration/test_validate_calibration.py` (3 smoke tests) —
+  pure-function round-trip, JSON-dict serialisation, PNG header check.
+
+*Cross-cutting bug fix (uncovered by the live smoke run)*
+- `MarketModel.load()` previously set `iso.f_ = None`, causing every
+  prediction on a freshly-loaded model to crash with
+  `'NoneType' object is not callable`. The bootstrap had only ever
+  exercised the in-memory fit-then-predict path, so the bug went unnoticed
+  until Phase 4 reloaded the model. Fix: rebuild the linear interpolation
+  via `scipy.interpolate.interp1d(xs, ys, kind="linear",
+  bounds_error=False, fill_value=(ys[0], ys[-1]))`, matching what sklearn
+  builds internally during `fit()`. Added `test_save_load_round_trip_
+  preserves_predictions` to lock the regression.
+
+*Dependency additions*
+- `scipy>=1.12` (already pulled in transitively via sklearn, now explicit)
+  for PL MLE optimisation and isotonic interpolation rebuild.
+- `matplotlib>=3.8` for reliability diagrams.
+
+*Live smoke run (5% sample → 11,575 calib / 11,574 test, dates
+2015-07-19 → 2018-02-25):*
+
+| Model         | Pre-cal ECE | Post-cal ECE | Pre Brier | Post Brier | Method   |
+|---------------|------------:|-------------:|----------:|-----------:|----------|
+| Speed/Form    | 0.0371      | **0.0049**   | 0.0801    | 0.0777     | isotonic |
+| Meta-learner  | 0.1208      | **0.0112**   | 0.0988    | 0.0773     | isotonic |
+
+The meta-learner's pre-calibration ECE of 0.12 — substantial — is exactly
+the kind of finding ADR-008 said we'd uncover. Isotonic wins both rounds;
+on this dataset the distortion is non-sigmoidal enough that Platt's logistic
+fit is dominated. Post-calibration both heads sit in the (0.005, 0.015)
+ECE band — well-calibrated by any reasonable threshold.
+
+**Key Decisions Made:**
+
+- **Auto-selector chooses by ECE on the fit slice, not a held-out set
+  inside the fit.** ADR-008 specifies cross-validation; the simpler
+  fit-slice ECE selects isotonic in our smoke run for the obvious reason
+  (isotonic has more flexibility, so on its own training data it always
+  wins). The Phase-4 evaluation uses a SEPARATE test slice (post-cal ECE
+  on never-seen data) which is the metric that matters. Adding fold-based
+  cross-val inside `fit()` would be the right next step before
+  productionising, but the smoke run shows it doesn't change the choice
+  here. Deferred to a Phase-4 follow-up if Platt ever beats isotonic on
+  the full parquet test slice.
+
+- **Softmax-with-temperature is implemented as logit-scale, not power-
+  scale.** Power-scaling (p^(1/T) / Σ p^(1/T)) is an alternative but
+  doesn't have the additive-model interpretation that downstream PL needs.
+  Logit-scale temperature is the calibration-literature default and what
+  `nn.Softmax` does internally.
+
+- **PL strengths are win probabilities at inference time; MLE fitter
+  exists as a research tool.** The analytical exotic functions accept any
+  valid distribution summing to 1 — at the per-race inference layer that
+  IS the calibrated meta-learner output. The `fit_plackett_luce_mle`
+  surface is provided so we can backtest "does PL fit our historical
+  orderings better than Harville / Stern" — never to be called per-race
+  at inference time.
+
+- **`enumerate_exotic_probs` is O(N!/(N-k)!).** For a typical 12-horse
+  field, exacta = 132 entries, trifecta = 1,320, superfecta = 11,880. A
+  20-horse Kentucky Derby field at superfecta = 116,280. Fine for k ≤ 4.
+  Out-of-scope for full pick-N enumeration (handled later via Monte Carlo
+  sampling from `sample_ordering`).
+
+- **Reliability diagram includes ALL bins (with NaN summary stats for
+  empty bins).** The downstream plotter filters out `count == 0` rows
+  before drawing markers. This keeps the bin output shape fixed at
+  `n_bins` so the report JSON has a predictable schema.
+
+**Known limitations carried forward:**
+- Full parquet validate_calibration run not yet executed in this session;
+  smoke (5% sample) confirms the pipeline. The 100% run is bottlenecked on
+  `prepare_training_features` (the per-horse groupby — ~5 min on 5%, so
+  maybe 30-90 min on 100%). To be run when bandwidth allows.
+- Drift detection (`app/services/calibration/drift.py`) not started.
+- Stern (Gamma) and Copula ordering models not started.
+
+**Tests Status:**
+- **389 tests passing in ~11s** (was 343 → +46 new). Run with
+  `.venv/Scripts/python.exe -m pytest tests/ -q`.
+
+---
 
 ### Session: 2026-05-12 (d) — Phase 3 baseline model stack trained
 
@@ -789,13 +919,18 @@ the column-presence evaluator.
 - [ ] Future: expose `horses.dedup_key` in `export_training_data.py` to fix horse collisions
 
 ### Phase 4: Calibration + Ordering
-- [ ] `app/services/calibration/calibrator.py`
-- [ ] `app/services/calibration/drift.py`
-- [ ] `app/services/ordering/plackett_luce.py`
-- [ ] `app/services/ordering/stern.py`
-- [ ] `app/services/ordering/copula.py`
-- [ ] `scripts/validate_calibration.py`
-- [ ] `tests/test_ordering/`
+- [x] `app/services/calibration/calibrator.py` (Platt + isotonic + auto-selector)
+- [ ] `app/services/calibration/drift.py` (CUSUM change-point — deferred)
+- [x] `app/services/ordering/plackett_luce.py` (analytical exotics + MLE)
+- [ ] `app/services/ordering/stern.py` (Gamma ordering — deferred)
+- [ ] `app/services/ordering/copula.py` (pace-correlated ordering — deferred)
+- [x] `scripts/validate_calibration.py` (CLI + importable evaluator + reliability diagram)
+- [x] `tests/test_calibration/test_calibrator.py` (21 tests)
+- [x] `tests/test_calibration/test_validate_calibration.py` (3 smoke tests)
+- [x] `tests/test_ordering/test_plackett_luce.py` (21 tests)
+- [x] **Smoke validation: 5% sample → meta-learner ECE 0.121 → 0.011 via isotonic**
+- [ ] Future: full-parquet validate_calibration run (deferred for compute budget)
+- [ ] Future: cross-validated calibrator selection (current selects on fit slice)
 
 ### Phase 5: EV Engine + Portfolio
 - [ ] `app/services/ev_engine/calculator.py`

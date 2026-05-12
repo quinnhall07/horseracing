@@ -34,6 +34,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from scipy.interpolate import interp1d
 from sklearn.isotonic import IsotonicRegression
 
 from app.core.logging import get_logger
@@ -129,12 +130,21 @@ class MarketModel:
         cfg = MarketModelConfig(**payload["config"])
         obj = cls(config=cfg)
         iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-        iso.X_thresholds_ = np.array(payload["iso_x"])
-        iso.y_thresholds_ = np.array(payload["iso_y"])
-        iso.X_min_ = float(iso.X_thresholds_.min())
-        iso.X_max_ = float(iso.X_thresholds_.max())
-        iso.f_ = None  # set on first call to predict via increasing_ inference
+        xs = np.asarray(payload["iso_x"], dtype=float)
+        ys = np.asarray(payload["iso_y"], dtype=float)
+        iso.X_thresholds_ = xs
+        iso.y_thresholds_ = ys
+        iso.X_min_ = float(xs.min())
+        iso.X_max_ = float(xs.max())
         iso.increasing_ = True
+        # Rebuild the linear interpolation that sklearn's IsotonicRegression
+        # constructs at fit time. `out_of_bounds="clip"` means we leave the
+        # boundary handling to numpy.clip in _transform; bounds_error=False
+        # mirrors what sklearn._build_f does for the same setting.
+        iso.f_ = interp1d(
+            xs, ys, kind="linear", bounds_error=False,
+            fill_value=(float(ys[0]), float(ys[-1])),
+        )
         obj.iso = iso
         obj.is_fitted = True
         return obj

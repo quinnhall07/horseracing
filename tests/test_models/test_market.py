@@ -53,3 +53,23 @@ def test_predict_without_fit_raises():
     model = MarketModel()
     with pytest.raises(RuntimeError):
         model.predict_proba(pd.DataFrame({"odds_final": [2.0], "race_id": ["x"], "win": [0]}))
+
+
+def test_save_load_round_trip_preserves_predictions(fitted_model, tmp_path):
+    """Regression: prior versions left iso.f_ unset after load(), so
+    predict_proba on a freshly-loaded model crashed with
+    "'NoneType' object is not callable" (surfaced by Phase-4
+    validate_calibration.py). Lock the round-trip down."""
+    model, df = fitted_model
+    artifact_dir = tmp_path / "market"
+    model.save(artifact_dir)
+
+    restored = MarketModel.load(artifact_dir)
+    out_before = model.predict_proba(df)
+    out_after = restored.predict_proba(df)
+
+    finite_mask = np.isfinite(out_before) & np.isfinite(out_after)
+    assert finite_mask.any()
+    assert np.allclose(out_before[finite_mask], out_after[finite_mask], atol=1e-9)
+    # NaN positions must match too.
+    assert np.array_equal(np.isnan(out_before), np.isnan(out_after))
