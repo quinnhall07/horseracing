@@ -455,3 +455,225 @@ spending the bandwidth.
 - Two flags: `--list-only` vs `--no-load` — rejected (the second tier of preview
   has no clear use case; the user can always run for real and inspect each
   step's parquet output if they want intermediate inspection).
+
+---
+
+## ADR-015: Field-Map `preprocess` Hook for Multi-CSV Datasets
+
+**Date:** 2026-05-12
+**Status:** Accepted
+
+**Context:**
+The original `map_and_clean.py` picked the largest CSV in a staging directory and
+read it as-is. Real Kaggle datasets often ship as normalized multi-CSV bundles —
+a `races.csv` (per-race) joined to a `runs.csv` or `horses.csv` (per-horse) on
+`race_id`. Picking only one of the two loses 50%+ of the columns and makes the
+field map impossible to author.
+
+**Decision:**
+Field-map entries can declare an optional `preprocess` field naming a callable
+in `scripts.db.preprocessors.PREPROCESSORS`:
+```python
+"gdaley/hkracing": {
+    "preprocess": "gdaley_hkracing_merge",
+    ...
+}
+```
+The named callable receives the staging directory and returns a single
+denormalized DataFrame. `map_and_clean.py` calls it instead of `_pick_primary_csv`
+when the field map sets it.
+
+**Rationale:**
+- Keeps the merge logic in code (versionable, testable) rather than as opaque
+  per-dataset preprocessing scripts the user has to remember to run.
+- Each preprocessor is small (typically 4 lines of pandas merge) and easy to
+  audit. Naming them in the field map keeps the dataset's full provenance
+  (slug → preprocess → columns → transformers) in one place.
+- Single-CSV datasets just omit the field — backward-compatible.
+
+**Rejected Alternatives:**
+- External pre-merge step that the user runs manually — rejected (breaks the
+  one-command-per-stage pipeline; introduces an undocumented manual step).
+- Glob-and-concat all CSVs by default — rejected (would silently merge
+  schema-incompatible files like `odds.csv` + `results.csv`).
+- A general-purpose JSON DSL for joins (`{"join": {...}}` in field map) —
+  rejected (overengineered for the 2-3 cases we have; a function is simpler
+  and more flexible).
+
+---
+
+## ADR-016: Quality-Gate Race-Level Grouping Must Match `race_dedup_key`
+
+**Date:** 2026-05-12
+**Status:** Accepted (corrects a bug introduced in the original quality_gate.py)
+
+**Context:**
+The original `quality_gate.race_level_issues()` grouped rows by
+`(race_date, track_code, race_number)` to detect cross-row violations
+(multiple winners, mixed distances/surfaces, duplicate horses). But
+`race_dedup_key` includes `(track, date, race_num, distance, surface)`. Some
+real datasets — Argentine venues that run turf + dirt cards in parallel —
+reuse `nro` (race_number) across multiple physically distinct races on the
+same date at the same venue. The dedup_key correctly stored these as separate
+`races` rows, but quality_gate falsely flagged them as "mixed distances /
+mixed surfaces / duplicate horses" violations and zeroed their scores. Result:
+317K of 323K Argentine rows rejected on a phantom violation.
+
+**Decision:**
+The race-level grouping in `quality_gate.race_level_issues()` and the
+race-key indexing in `run_quality_gate()` were updated to use all 5 fields
+of the dedup_key:
+`(date, track, race_num, distance_furlongs, surface)`. The "mixed distances"
+and "mixed surfaces" sub-checks were removed entirely — they're a no-op once
+you group by those fields, since values within a group are constant by
+construction. The remaining checks (multiple winners, duplicate horses)
+operate per dedup_key group.
+
+**Rationale:**
+The grouping function MUST be a strict refinement of the dedup_key, never
+coarser. If quality_gate groups more aggressively than load_to_db dedupes,
+quality_gate sees "violations" that aren't real. The simplest invariant is
+"use the same key everywhere" — adopted.
+
+**Rejected Alternatives:**
+- Loosen the dedup_key to drop distance + surface — rejected (would cause
+  Argentine venues' parallel turf+dirt races to incorrectly merge, losing
+  ~half the actual race count).
+- Per-dataset configurable race-key — rejected (extra config surface for no
+  win; the dedup_key formula already captures everything we need).
+- Keep the loose grouping but skip the mixed-distance/surface checks for
+  datasets known to violate — rejected (per-dataset-special-casing is the
+  exact maintenance burden the canonical pipeline was designed to avoid).
+
+---
+
+## ADR-017: `normalize_name` Uses Unicode-Aware Regex
+
+**Date:** 2026-05-12
+**Status:** Accepted (corrects a bug introduced in the original dedup.py)
+
+**Context:**
+The original `normalize_name()` used `re.compile(r"[^a-z0-9 ]")` to strip
+punctuation. This regex is ASCII-only — it stripped every non-Roman character.
+For the JRA dataset (1.6M rows of Japanese horse names like `ワクセイ` and
+trainer names like `柏崎正次`), normalize_name returned the empty string for
+every row. Quality_gate then rejected all 1.6M rows with
+`"missing horse_name"` + `"duplicate horses within race: ['']"`.
+
+**Decision:**
+Changed the punctuation regex to `re.compile(r"[^\w ]", re.UNICODE)`. Python 3's
+`\w` is Unicode-aware by default and matches CJK / Cyrillic / Greek / accented
+Roman letters. Apostrophes, dashes, periods, and other punctuation are still
+stripped (they're not in `\w`). Whitespace and case-folding behavior are
+unchanged.
+
+**Verified:** `normalize_name("O'Brien")` still produces `"obrien"` (apostrophe
+stripped); `normalize_name("ワクセイ")` now produces `"ワクセイ"` (preserved
+intact). All 234 tests pass with the change.
+
+**Compatibility note:** This change does not violate ADR-012 (frozen dedup-key
+contract). The hash *formula* is unchanged. The change to `normalize_name`
+produces different hashes for non-ASCII names — but those names previously
+all hashed to the same `hash("")`, so no real horses were ever distinguishable
+under the old behavior. The new behavior is a strict improvement. ASCII names
+hash identically before and after.
+
+**Rejected Alternatives:**
+- ASCII-fold non-Roman names (e.g., `ワクセイ` → `wakusei` via romanization)
+  — rejected (requires per-language romanization tables; "wakusei" wouldn't
+  match Equibase / DRF cataloging conventions which preserve katakana).
+- Skip normalization for non-ASCII names — rejected (would create two
+  different code paths and inconsistent dedup behavior).
+- Bump SCHEMA_VERSION to invalidate old hashes — unnecessary because no
+  ASCII hash changed.
+
+---
+
+## ADR-018: Heuristic Mapper Uses Prioritized Exact-Match Then Fuzzy
+
+**Date:** 2026-05-12
+**Status:** Accepted (replaces the original `_HEURISTICS` regex-only design)
+
+**Context:**
+The original `_HEURISTICS` resolver was a single regex per canonical field with
+first-column-match-wins iteration. For `horse_name`, the regex `(horse|name)`
+greedily matched `race_name` / `Course name` / `course_name` BEFORE the actual
+`horse_name` column. For `finish_position`, `(finish|position|place|pos)`
+matched `post_position` (gate position) and `Draw place runs` (a historical
+stat) before the literal `finish_position` column. Result: the auto-mapper
+catastrophically mapped wrong columns even when the right ones were obviously
+named.
+
+**Decision:**
+Replaced single-regex resolution with a `_FieldSpec(exact=[...], fuzzy=...,
+blocklist=[...])` per canonical field. Resolution algorithm:
+
+1. **Exact-match phase** — try each candidate in `exact` (case-insensitive)
+   against the column list; first hit wins. Order encodes priority:
+   `["horse_name", "horsename", "horse", "Name", ...]` — most specific first.
+2. **Fuzzy phase** (only if exact failed AND `fuzzy is not None`) — apply the
+   fuzzy regex to columns NOT matching any pattern in `blocklist`.
+
+For `horse_name`, the fuzzy phase is intentionally `None` because no generic
+regex is safe (a fallback like `(horse|name)` would re-introduce the original
+bug). For `finish_position`, the blocklist explicitly excludes `post_position`,
+`start_position`, `draw_position`, `running_position`.
+
+**Rationale:**
+Real datasets use predictable column names ~80% of the time (`horse_name`,
+`horsename`, `Name`, `horse`). For those, an ordered exact-match list works
+perfectly. For the remaining ~20%, the fuzzy phase with blocklists handles
+column-name variations without the false-positive disasters of the original
+greedy regex.
+
+**Rejected Alternatives:**
+- Levenshtein-distance fuzzy matching — rejected (slow on 100+ column
+  datasets; produces non-obvious matches that are hard to debug).
+- Hand-write a column for every dataset — rejected (defeats the purpose of
+  `--auto-map`; the heuristic is the fallback for datasets we don't have a
+  registered map for).
+- Configurable per-jurisdiction heuristics — rejected (the column conventions
+  are dataset-specific, not jurisdiction-specific; a JP dataset might use
+  `horse_name` while a US dataset uses `Horse`).
+
+---
+
+## ADR-019: `race_number` is Optional on `CanonicalRace`; Quality Gate Enforces Presence
+
+**Date:** 2026-05-12
+**Status:** Accepted (refines ADR-011)
+
+**Context:**
+The original `CanonicalRace.race_number: int` was Pydantic-required. Many real
+datasets identify races by `race_id` (string ID), `card_id`, or post-time of day
+rather than an explicit numeric race number. Pydantic rejected 100% of rows
+from sheikhbarabas, ahmedabdulhamid, felipetappata, and noqcks at the schema
+validation step — before the quality gate even saw them.
+
+**Decision:**
+Made `race_number: int | None = None` in `CanonicalRace`. Added it to the
+quality_gate's load-required hard-failure block (alongside distance / surface /
+jurisdiction per ADR-011): if missing, score is forced to 0.0 with reason
+`"missing race_number (required for dedup_key + SQL load)"`. Field maps for
+datasets without an explicit race-number column synthesize one — sheikhbarabas
+uses `time_string_to_minutes` on the post-time column ("5:25" → 325 minutes
+since midnight); felipetappata uses the `nro` column directly.
+
+**Rationale:**
+- Pydantic should validate identity ("can this row be parsed at all"), not
+  loadability ("can this row's row be persisted in this DB"). The latter
+  changes per dataset and is the quality gate's job.
+- Making it Optional at the Pydantic layer means map_and_clean produces all
+  rows for the quality gate to score — preserving the audit trail for missing
+  race_number values that we'd otherwise silently drop.
+- The error message at the quality gate is more actionable than Pydantic's
+  generic `"Input should be a valid integer"` — it points the operator at
+  the field map authoring as the fix.
+
+**Rejected Alternatives:**
+- Keep race_number required, require all field maps to synthesize one —
+  rejected (Pydantic errors don't surface in the rejected/reasons.jsonl, so
+  it's harder to diagnose new datasets).
+- Drop race_number from the dedup_key entirely — rejected (would cause
+  multiple races on the same date+track+distance+surface to collide; not
+  acceptable for jurisdictions like UK or JP that run 8+ races per card).

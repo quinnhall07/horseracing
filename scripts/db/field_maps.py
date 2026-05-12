@@ -263,6 +263,37 @@ FIELD_MAPS: dict[str, dict[str, Any]] = {
     },
 
     # ─────────────────────────────────────────────────────────────────────
+    # Argentina — felipetappata. Active. ~323K rows.
+    # Spanish column conventions: nro = race number, arena = dirt (sand),
+    # cesped = turf (grass). Distance in metres. Weight in kg.
+    # No trainer column. Some rows may use "nro_raw" for an unprocessed
+    # race-number; "nro" is post-processed and reliable.
+    # ─────────────────────────────────────────────────────────────────────
+    "felipetappata/thoroughbred-races-in-argentina": {
+        "source_format": "csv",
+        "jurisdiction":  "AR",
+        "race_fields": {
+            "track_code":        "venue",            # "San Isidro" / "Palermo" / etc.
+            "race_date":         "date",
+            "race_number":       "nro",              # already integer
+            "distance_furlongs": "dist",             # metres → furlongs
+            "surface":           "surface",          # arena/cesped/sintetico
+            "condition":         "cond",
+        },
+        "result_fields": {
+            "horse_name":      "horse",
+            "finish_position": "pos",
+            "jockey":          "jockey",
+            "weight_lbs":      "jockey_weight",      # carried weight (kg → lbs)
+        },                                            # NOT "weight" (that's body weight)
+        "transformers": {
+            "distance_furlongs": "metres_to_furlongs",
+            "surface":           "ar_surface_to_canonical",
+            "weight_lbs":        "kg_to_lbs",
+        },
+    },
+
+    # ─────────────────────────────────────────────────────────────────────
     # HK — gdaley/horseracing-in-hk drafted in DATA_PIPELINE.md but slug
     # has been renamed to gdaley/hkracing (above). Kept for back-compat.
     # ─────────────────────────────────────────────────────────────────────

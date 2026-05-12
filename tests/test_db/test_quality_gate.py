@@ -170,17 +170,24 @@ def test_race_level_detects_multiple_winners():
     assert any("multiple winners" in s for s in next(iter(issues.values())))
 
 
-def test_race_level_detects_mixed_distances():
+def test_race_level_treats_different_distances_as_different_races():
+    """Same (date, track, race_num) at different distances → 2 separate races,
+    NOT a 'mixed distances' violation. Argentine venues that run turf + dirt
+    cards in parallel use the same nro for distinct physical races, and the
+    dedup_key (which includes distance + surface) correctly stores them as
+    separate `races` rows. Quality_gate must not falsely flag this.
+    """
     df = pd.DataFrame([
-        {"race_race_date": date(2026, 5, 10), "race_track_code": "CD",
-         "race_race_number": 4, "race_distance_furlongs": 4.5, "race_surface": "dirt",
+        {"race_race_date": date(2026, 5, 10), "race_track_code": "AR",
+         "race_race_number": 5, "race_distance_furlongs": 5.0, "race_surface": "turf",
          "horse_name_normalized": "horse a", "finish_position": 1},
-        {"race_race_date": date(2026, 5, 10), "race_track_code": "CD",
-         "race_race_number": 4, "race_distance_furlongs": 6.0, "race_surface": "dirt",
-         "horse_name_normalized": "horse b", "finish_position": 2},
+        {"race_race_date": date(2026, 5, 10), "race_track_code": "AR",
+         "race_race_number": 5, "race_distance_furlongs": 7.0, "race_surface": "dirt",
+         "horse_name_normalized": "horse b", "finish_position": 1},
     ])
     issues = race_level_issues(df)
-    assert any("mixed distances" in s for s in next(iter(issues.values())))
+    # No violation — these are two separate races sharing nro=5
+    assert issues == {}
 
 
 def test_race_level_detects_duplicate_horse():

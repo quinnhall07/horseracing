@@ -7,13 +7,122 @@ Format: newest session at the top.
 
 ## Current State
 
-**Phase:** 0 — Master Training Database (code complete; ready for live run) + Phase 1 — PDF Ingestion (paused at scaffolding milestone)
-**Last completed task:** `auto_ingest.py` — Kaggle-keyword-driven bulk discovery + ingestion orchestrator; dry-run successfully surfaced 38 unique candidate datasets across 6 keywords (~3.4 GB total).
-**Next task:** User runs `python scripts/db/auto_ingest.py --auto-map --username quinnhall07` to bulk-load discovered datasets. Audit via `dedup_report.py`, then export training parquet. After that: resume Phase 1 bootstrap (`app/core/logging.py`, `app/main.py`, `app/api/v1/ingest.py`, `app/db/`).
+**Phase:** 0 — Master Training Database (**LOADED**) + Phase 1 — PDF Ingestion (paused at scaffolding milestone)
+**Last completed task:** Master DB populated with **2,626,284 race results** across 336,967 races, 263,209 horses, 4 jurisdictions (UK / HK / JP / AR), 1986-2023. Zero duplicate dedup keys across every deduped table. ~80% of rows scored 0.85-0.95 at quality gate.
+**Next task:** Export ML training parquet (`python scripts/db/export_training_data.py`), recommended with jurisdiction filter excluding AR until the AR splitting issue is addressed. Then bootstrap Phase 3 (`backend/scripts/bootstrap_models.py`) to train baseline Speed/Form LightGBM. After that: resume Phase 1 bootstrap (`app/core/logging.py`, `app/main.py`, `app/api/v1/ingest.py`).
 
 ---
 
 ## Session Log
+
+### Session: 2026-05-12 — Bug-fix sweep + master DB populated (2.6M results loaded)
+
+**Context:**
+The 2026-05-11 (c) auto-ingest run (`auto_ingest_run1.json`) had loaded **0 rows out of 1.5M+ downloaded**.
+Six datasets registered in the DB had `row_count_ingested = NULL` because every row failed at map+clean
+or quality_gate. This session diagnosed root causes, fixed them, then hand-mapped the highest-quality
+datasets to populate the DB end-to-end.
+
+**Bugs found and fixed (in priority order):**
+
+1. **`race_number` Pydantic-required but missing in most non-US datasets.** Many datasets identify races
+   by `race_id` (string), `card_id`, or post-time rather than an explicit numeric race number. Fix:
+   made `race_number` `Optional` in `CanonicalRace`, added it as a load-required hard failure in
+   `quality_gate` (zero score if None — same justification as distance/surface/jurisdiction per
+   ADR-011 / ADR-019).
+
+2. **Heuristic regex `(horse|name)` matched `race_name` / `Course name` before `horse_name`.**
+   First-match-wins with greedy `name` was catastrophically wrong. Fix: replaced single regex per field
+   with `_FieldSpec(exact=[priority list], fuzzy=optional, blocklist=[])`. Tries exact-match (case-
+   insensitive) first, then fuzzy with explicit blocklist for known-wrong matches like `post_position`
+   / `course_name`. See ADR-018.
+
+3. **`normalize_name()` stripped all non-ASCII characters.** `[^a-z0-9 ]` regex turned `ワクセイ`
+   (JRA katakana) into empty string, which then hit "missing horse_name" + "duplicate horses within
+   race: ['']" — JRA's 1.6M rows ALL failed. Fix: regex is now `[^\w ]` with `re.UNICODE`, preserving
+   CJK / Cyrillic / accented Roman names while still stripping `'`, `-`, `.` from English names. See
+   ADR-017.
+
+4. **Quality_gate's race-level grouping disagreed with `race_dedup_key`.** quality_gate grouped by
+   `(date, track, race_num)`, but the dedup_key includes `(date, track, race_num, distance, surface)`.
+   Argentine venues that run turf + dirt cards in parallel reuse `nro` across distinct physical races.
+   Quality_gate flagged these as "mixed distances" / "duplicate horses" violations even though they
+   were correctly stored as separate races by load_to_db. Fix: quality_gate now groups by all 5
+   dedup_key fields. The "mixed distances within race" check was removed (it's a no-op once you group
+   by distance). See ADR-016.
+
+5. **Auto-built field maps had `transformers: {}`.** Surfaces stayed as raw "Heavy"/"Good"/"GOOD TO
+   FIRM"; odds stayed as fractional "5/2"; both broke the dedup_key. Fix: `build_heuristic_map` now
+   auto-attaches default transformers (parse_odds_to_decimal, normalize_surface or uk_going_to_surface,
+   normalize_condition or uk_going_to_condition, time_string_to_seconds, stones_to_lbs) based on what
+   columns it found.
+
+**New infrastructure added:**
+
+- **`scripts/db/preprocessors.py`** — registry of multi-CSV merge functions. Datasets that ship as
+  `races.csv` + `runs.csv` (joined on `race_id`) declare a `preprocess` field in their FIELD_MAPS
+  entry; map_and_clean.py calls the named function instead of `_pick_primary_csv`. See ADR-015.
+  Two preprocessors implemented: `gdaley_hkracing_merge`, `lantanacamara_hk_merge`.
+
+- **6 new transformers** in `transformers.py`:
+  - `time_string_to_minutes` — parses "HH:MM" into minutes-since-midnight (race_number proxy when
+    only post-time is available, e.g. UK sheikhbarabas)
+  - `extract_int` — pulls first contiguous integer from a string (for `RID1002-IE-05` → 1002)
+  - `kg_to_lbs` — for JRA carried weights (in kg)
+  - `jpn_surface_to_canonical` — maps `芝` → turf, `ダート` → dirt
+  - `jpn_condition_to_canonical` — maps `良` / `稍重` / `重` / `不良` to fast/good/soft/heavy
+  - `ar_surface_to_canonical` — maps Spanish `arena`/`cesped`/`sintetico` to dirt/turf/synthetic
+
+**Hand-written field maps added (5 new):**
+- `sheikhbarabas/horse-racing-results-uk-ireland-2005-to-2019` (UK/IE, ~744K rows; race_number
+  synthesized from post-time via `time_string_to_minutes`)
+- `gdaley/hkracing` (HK, ~80K rows; multi-CSV merge; only IDs for horse/jockey/trainer)
+- `lantanacamara/hong-kong-horse-racing` (HK, ~30K rows; multi-CSV merge; real names)
+- `takamotoki/jra-horse-racing-dataset` (JP, ~1.6M rows; Japanese column names)
+- `felipetappata/thoroughbred-races-in-argentina` (AR, ~323K rows; Spanish conventions; uses
+  `jockey_weight` not `weight` to avoid body-weight-vs-carried-weight contamination)
+
+**Master DB final state:**
+
+| Jurisdiction | Races   | Results    | Date range          | Source                      |
+|--------------|---------|------------|---------------------|-----------------------------|
+| JP           | 121,785 | 1,609,930  | 1986-01 → 2021-07   | takamotoki/jra              |
+| AR           | 137,344 | 306,290    | 2016-06 → 2023-10   | felipetappata               |
+| UK           |  69,135 | 601,405    | 2005-04 → 2019-12   | sheikhbarabas               |
+| HK           |   8,703 | 108,659    | 1997-06 → 2017-07   | gdaley + lantanacamara      |
+| **Total**    | **336,967** | **2,626,284** | **1986 → 2023** | **5 hand-mapped datasets**  |
+
+Quality score distribution across all 2.6M results:
+- 0.95+ (excellent): 130,231 (5%)
+- 0.85-0.95: 1,965,861 (75%)
+- 0.75-0.85: 71,170 (3%)
+- 0.60-0.75 (minimum pass): 459,022 (17%)
+
+**Auto-ingest #2 results (with bug-fixes):** 0 additional rows loaded. The remaining 21 low_score
+datasets had column conventions the heuristic still couldn't infer; the 7 no_csv datasets were
+non-CSV; the 4 evaluate-failed had encoding/parsing errors; the others (noqcks workouts, prashant111
+tipster bets, mexwell HK dividends-only) are not actually race-results data despite scoring well at
+the column-presence evaluator.
+
+**Known caveats** (documented for Phase 3 model training):
+- **Argentina has structural data-quality issues.** Avg field size of 2.2 is unrealistically low
+  (real races ~10 horses) — the `nro` field is reused across multiple physical races at the same
+  venue/date, and even with distance+surface in the dedup_key the resulting groups are fragmented.
+  AR has zero odds data. Some `jockey_weight` values are contaminated with body weight (max 1318 lbs).
+  Mean score 0.66. Recommend filtering AR out of model training until a venue-specific course
+  identifier can be derived.
+- **HK has two non-overlapping naming conventions.** gdaley uses numeric IDs ("3875") for horses
+  + "ST"/"HV" tracks (1997-2005); lantanacamara uses real names ("DOUBLE DRAGON") + "Sha Tin" /
+  "Happy Valley" (2014-2017). Won't cross-dedup, but date ranges don't overlap.
+- **`tracks` table is empty.** load_to_db never populates it. Aspirational table for now.
+- **JRA `purse(万円)` left raw** (units of 10,000 JPY rather than USD). quality_gate doesn't validate
+  purse so this isn't blocking — the field is informational for now.
+
+**Tests Status:**
+- 234 tests passing in ~3.0s. The mixed-distances test was rewritten to assert the NEW behavior
+  (different distances at the same nro = separate races, not a violation).
+
+---
 
 ### Session: 2026-05-11 (c) — Auto-discovery ingestion + bug fixes
 
@@ -321,11 +430,15 @@ Format: newest session at the top.
 - [x] `scripts/db/dedup_report.py`
 - [x] `scripts/db/export_training_data.py`
 - [x] `scripts/db/auto_ingest.py` (Kaggle keyword-driven bulk orchestrator)
+- [x] `scripts/db/preprocessors.py` (multi-CSV merge hook for map_and_clean)
 - [x] `tests/test_db/test_dedup.py` (11 tests)
 - [x] `tests/test_db/test_transformers.py` (27 tests)
-- [x] `tests/test_db/test_quality_gate.py` (20 tests)
+- [x] `tests/test_db/test_quality_gate.py` (21 tests)
 - [x] `tests/test_db/test_pipeline.py` (3 end-to-end tests)
-- [ ] Live run: ingest joebeachcapital/horse-racing → load → export training parquet
+- [x] **Live run: master DB populated with 2.6M results across UK / HK / JP / AR (1986-2023)**
+- [ ] Export ML training parquet via `scripts/db/export_training_data.py` (recommend `--jurisdictions UK,HK,JP` until AR splitting fixed)
+- [ ] Future: derive a venue-specific course identifier for AR to fix the over-split races issue
+- [ ] Future: populate `tracks` table from existing `races` data (currently unused)
 
 ### Phase 1: PDF Ingestion
 - [ ] `app/core/config.py` — scaffold only; full BaseSettings present but logging/db settings unused yet

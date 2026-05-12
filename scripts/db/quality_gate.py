@@ -141,19 +141,28 @@ def score_row(row: dict) -> tuple[float, list[str]]:
 # ─── cross-row race-level validation ──────────────────────────────────────
 
 def race_level_issues(df: pd.DataFrame) -> dict[tuple, list[str]]:
-    """Return {(date, track, race_num): [issues...]} for race-level violations.
+    """Return {race_key: [issues...]} for race-level violations.
+
+    Race grouping must match the race_dedup_key formula
+    (track, date, race_num, distance, surface) — otherwise datasets where
+    the same race_number is reused across multiple physical races (e.g.,
+    Argentine venues that run turf + dirt cards in parallel) get falsely
+    flagged as "mixed distances" / "duplicate horses".
 
     Checks:
-      - At most one finish_position == 1
-      - All horses in same race share the same distance + surface + track
+      - At most one finish_position == 1 per race
       - No horse appears twice in the same race
-    Field-size mismatch is informational only — many sources don't carry it.
+    Distance/surface checks were removed — they are now part of the grouping
+    key, so within a group they're constant by construction.
     """
     out: dict[tuple, list[str]] = {}
     if df.empty:
         return out
 
-    group_cols = ["race_race_date", "race_track_code", "race_race_number"]
+    group_cols = [
+        "race_race_date", "race_track_code", "race_race_number",
+        "race_distance_furlongs", "race_surface",
+    ]
     for col in group_cols:
         if col not in df.columns:
             return out
@@ -165,17 +174,6 @@ def race_level_issues(df: pd.DataFrame) -> dict[tuple, list[str]]:
         if winners > 1:
             problems.append(f"multiple winners ({int(winners)})")
 
-        # Single distance + surface across the race.
-        if "race_distance_furlongs" in sub.columns:
-            dists = sub["race_distance_furlongs"].dropna().unique()
-            if len(dists) > 1:
-                problems.append(f"mixed distances within race: {sorted(dists.tolist())}")
-        if "race_surface" in sub.columns:
-            surfs = sub["race_surface"].dropna().unique()
-            if len(surfs) > 1:
-                problems.append(f"mixed surfaces within race: {sorted(surfs.tolist())}")
-
-        # Same horse twice.
         if "horse_name_normalized" in sub.columns:
             dup_horses = sub["horse_name_normalized"].dropna()
             dup_counts = dup_horses.value_counts()
@@ -217,11 +215,13 @@ def run_quality_gate(input_dir: Path) -> dict:
     df["data_quality_score"] = scores
     df["_qg_issues"] = reasons
 
-    # Cross-row issues — flag rejected rows in violating races.
+    # Cross-row issues — flag rejected rows in violating races. The grouping
+    # key here MUST match the one inside race_level_issues() exactly.
     race_problems = race_level_issues(df)
     if race_problems:
         race_keys_idx = list(zip(
-            df["race_race_date"], df["race_track_code"], df["race_race_number"]
+            df["race_race_date"], df["race_track_code"], df["race_race_number"],
+            df["race_distance_furlongs"], df["race_surface"],
         ))
         for i, key in enumerate(race_keys_idx):
             if key in race_problems:

@@ -213,6 +213,27 @@ def uk_going_to_condition(going: str | None) -> str | None:
     return g  # passthrough for unknown values
 
 
+# ─── Argentina (Spanish surface terms) ────────────────────────────────────
+
+_AR_SURFACE_MAP = {
+    "arena":     "dirt",       # sand
+    "cesped":    "turf",       # grass (sometimes spelled "césped")
+    "césped":    "turf",
+    "sintetico": "synthetic",  # synthetic
+    "sintético": "synthetic",
+}
+
+
+def ar_surface_to_canonical(raw: str | None) -> str | None:
+    """Argentine racing surface → canonical surface."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if not s:
+        return None
+    return _AR_SURFACE_MAP.get(s, s)
+
+
 # ─── JRA (Japan) ──────────────────────────────────────────────────────────
 
 # Surface: 芝 = turf, ダート = dirt, 障 = jumps (treat as turf for ML purposes)
@@ -430,6 +451,7 @@ TRANSFORMERS: dict[str, Callable] = {
     "hk_going_to_condition":   hk_going_to_condition,
     "jpn_surface_to_canonical": jpn_surface_to_canonical,
     "jpn_condition_to_canonical": jpn_condition_to_canonical,
+    "ar_surface_to_canonical": ar_surface_to_canonical,
     "normalize_surface":       normalize_surface,
     "normalize_condition":     normalize_condition,
     "time_string_to_seconds":  time_string_to_seconds,
