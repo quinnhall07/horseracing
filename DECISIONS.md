@@ -677,3 +677,435 @@ since midnight); felipetappata uses the `nro` column directly.
 - Drop race_number from the dedup_key entirely — rejected (would cause
   multiple races on the same date+track+distance+surface to collide; not
   acceptable for jurisdictions like UK or JP that run 8+ races per card).
+
+---
+
+## ADR-020: Live Ingestion DB is Separate from Master Training DB
+
+**Date:** 2026-05-12
+**Status:** Accepted
+
+**Context:**
+Phase 1 needs durable storage for PDFs uploaded through the live API. The
+Phase 0 master training DB at `data/db/master.db` already has races / horses /
+race_results / jockeys / trainers tables. The naive option is to reuse those
+tables and tag the new rows with a `source = "live_ingest"` column.
+
+**Decision:**
+The live ingestion DB is a SEPARATE SQLite/PostgreSQL database (default
+`./horseracing.db`, overridable via `HRBS_DATABASE_URL`). It has its own ORM
+tree under `app/db/models.py`: `IngestedCard` → `IngestedRace` →
+`IngestedHorse` → `IngestedPPLine`, with `cascade="all, delete-orphan"` so a
+card delete wipes the subtree cleanly.
+
+**Rationale:**
+- Different access patterns. Master DB is read-heavy for training queries
+  (full table scans, aggregate joins). Live DB is write-heavy for individual
+  card ingests, mostly point lookups for serving the UI. Mixing locks both.
+- Different schemas. The master DB is normalised around dedup keys (one
+  horse row across thousands of races). The live DB models a single PDF
+  upload tree where each card is independent. Forcing them into one schema
+  either bloats master with parse_confidence columns or makes live ingest
+  unnecessarily complex with dedup logic.
+- Different lifecycles. Master DB gets re-built from scratch when a new
+  Kaggle dataset lands. Live DB is append-only over time. Coupling them
+  means every master rebuild risks blowing away live history.
+
+**Rejected Alternatives:**
+- Single shared DB with a `source` column — rejected (schemas don't overlap
+  cleanly; locks would bite under concurrent training + ingest load).
+- In-memory live state, no persistence — rejected (UI needs to retrieve
+  past cards; refreshing the page shouldn't lose data).
+
+---
+
+## ADR-021: EquibaseParser is a Thin Subclass of BrisnetParser
+
+**Date:** 2026-05-12
+**Status:** Accepted (provisional — revisit when real Equibase PDFs land)
+
+**Context:**
+Format detection routes Brisnet UP / Equibase / DRF to format-specific
+parsers. We have Brisnet sample data but neither Equibase nor DRF sample
+PDFs yet. Without real samples, attempting format-specific regexes for
+Equibase is speculative — we'd just be re-implementing the Brisnet parser
+under a different name.
+
+**Decision:**
+`EquibaseParser` is `class EquibaseParser(BrisnetParser): pass`. The
+extractor dispatches on format and routes the `equibase` label to it.
+When real Equibase PDFs surface format-specific divergences (different
+speed-figure column header, workout-table position, fraction-time
+formatting), the overrides go onto this subclass.
+
+**Rationale:**
+- Dispatch separation is cheap and has value NOW (the format label is
+  carried through downstream telemetry, audit trail, etc.).
+- The regex layer is the expensive thing to fork prematurely — without
+  samples it's all guessing. Better to inherit the working Brisnet impl
+  than to write a divergent parser that breaks on the first real PDF.
+- DRF currently has no parser class — it still falls back to BrisnetParser
+  via the extractor's "DRF parser not yet implemented" warning path,
+  because there's not even a useful dispatch label to preserve yet.
+
+**Rejected Alternatives:**
+- Full Equibase regex layer from scratch — premature, no samples.
+- Make BrisnetParser format-aware via a `_format` attribute — rejected
+  (mixes responsibilities; cleaner to subclass when needed).
+
+---
+
+## ADR-022: EWM Direction in PP Context — Reverse Before pandas .ewm()
+
+**Date:** 2026-05-12
+**Status:** Accepted
+
+**Context:**
+The feature engineering layer computes EWM (alpha=0.4) of speed figures
+per CLAUDE.md §8. The HorseEntry schema enforces `pp_lines` are
+most-recent-FIRST (validated by `_sort_pp_lines` model validator). But
+pandas' `Series.ewm(alpha=0.4, adjust=True).mean()` weights the LAST
+element of the input most heavily — opposite convention.
+
+If you call `.ewm()` directly on the most-recent-first PP list, you weight
+the OLDEST race heaviest, which is backwards from what we want.
+
+**Decision:**
+`ewm_speed()` in `app/services/feature_engineering/speed_features.py`
+explicitly `list(reversed(figs))` before constructing the pandas Series.
+The reverse step + docstring note about the direction are mandatory; any
+future rolling/EWM aggregate over `pp_lines` must do the same.
+
+The training-data path (`prepare_training_features`) avoids this because
+it works on a long-form DataFrame sorted ascending by date — pandas'
+natural convention then matches: most-recent rows are the LAST rows in
+the group, and `groupby.shift(1).ewm(...)` correctly weights recent
+history.
+
+**Rationale:**
+- Two different code paths (live inference from RaceCard vs. training
+  from parquet) work with the data in opposite orders. Making the schema
+  store one direction and forcing every aggregator to be aware of it is
+  the simplest safe approach.
+- A test asserts `ewm_speed([100, 80])` weights 100 more heavily than the
+  simple mean — locks in the direction so future refactors can't silently
+  flip it.
+
+**Rejected Alternatives:**
+- Change the schema to store most-recent-LAST — rejected (downstream UI
+  consumes pp_lines and most-recent-first is the natural display order).
+- Use a custom EWM implementation iterating in the desired direction —
+  rejected (pandas .ewm() is well-tested; reinventing it for a direction
+  flip is premature).
+
+---
+
+## ADR-023: Trainer Continuity is a Documented Weak Proxy
+
+**Date:** 2026-05-12
+**Status:** Accepted (will be superseded once richer PP data is available)
+
+**Context:**
+The connections feature module needs to know whether today's
+jockey/trainer combination is new for the horse, or a continuation. The
+`HorseEntry` schema carries today's trainer; `PastPerformanceLine` carries
+the per-PP `jockey` but NOT a per-PP `trainer` — Brisnet's dense PP table
+omits the per-PP trainer to save horizontal space.
+
+**Decision:**
+`horse_connections_summary().trainer_continuity` returns 1.0 if today's
+trainer is present AND today's jockey matches the most recent PP jockey,
+else 0.0; None if either today's trainer or PP history is absent. The
+docstring and the module header both flag this as a proxy and identify
+the unblock criterion (per-PP trainer in the schema).
+
+**Rationale:**
+- Jockey-as-trainer-proxy is empirically valid: trainers persist across
+  riders far more often than they change them. So a horse with the same
+  jockey today as last race is almost certainly with the same trainer.
+- The full fix requires parsing the Brisnet horse-header trainer name
+  AND the per-PP "comment" field for trainer changes — a non-trivial NLP
+  task that belongs in Phase 2's NLP follow-up, not in the parser.
+- The Phase 3 ConnectionsModel does NOT depend on this proxy — it works
+  off the master DB's full per-result jockey/trainer columns. So the
+  proxy only matters for live-inference feature display; it's not on
+  any critical path.
+
+**Rejected Alternatives:**
+- Always return 1.0 (assume continuity) — rejected (creates false-positive
+  signal in cases where the trainer actually did change).
+- Always return None — rejected (loses the easy-but-correct cases where
+  jockey continuity strongly implies trainer continuity).
+- Extend PastPerformanceLine with optional trainer field — rejected for
+  Phase 2 (deferred until the comment-line NLP work exposes it).
+
+---
+
+## ADR-024: Softmax Operates on Raw LightGBM Scores, Not Sigmoided Probabilities
+
+**Date:** 2026-05-12
+**Status:** Accepted
+
+**Context:**
+After fitting the Speed/Form LightGBM binary classifier, we need a
+per-race probability distribution that sums to 1 (so downstream code can
+treat it as a discrete distribution over starters). LightGBM exposes two
+output modes:
+1. `predict(...)` → sigmoid-squashed probabilities in [0, 1].
+2. `predict(..., raw_score=True)` → pre-sigmoid additive log-odds.
+
+We could softmax either across the in-race field. The choice matters at
+the tails (longshots and chalk).
+
+**Decision:**
+`SpeedFormModel.predict_softmax()` uses raw scores. The softmax operates
+on the additive log-odds and produces the per-race distribution.
+
+**Rationale:**
+- Softmax is the exponential of a linear scaling of inputs. On raw scores
+  it's mathematically equivalent to a normalised exp(score), which is
+  what additive-model log-odds are designed for.
+- Sigmoid-then-renormalise double-squashes the dynamic range: sigmoid
+  compresses extreme scores toward 0 or 1, then softmax compresses them
+  again. The result is a distribution flatter than the model's actual
+  signal — particularly harmful at the tails where the win signal lives.
+- The downstream Plackett-Luce ordering model (Phase 4) consumes
+  log-odds-style strength parameters. Raw scores feed it natively.
+- Calibration (Phase 4 Platt/isotonic) operates on EITHER output — using
+  raw scores here doesn't preclude calibrating later.
+
+**Rejected Alternatives:**
+- Sigmoid then renormalise — rejected for tail-compression reason above.
+- Per-row sigmoid output without renormalisation — rejected (per-race
+  probs need to sum to 1 for downstream EV / portfolio code).
+
+---
+
+## ADR-025: Orthogonalisation Lives in the Meta-Learner, Not the Sub-Models
+
+**Date:** 2026-05-12
+**Status:** Accepted (implements CLAUDE.md §2 mandate)
+
+**Context:**
+CLAUDE.md §2 mandates that sub-model inputs be orthogonalised before being
+fed to the meta-learner — speed figures already incorporate pace, so the
+raw pace_scenario output and the raw speed_form output share signal that
+the meta-learner shouldn't double-count.
+
+The orthogonalisation could live in two places:
+1. Inside each sub-model: it knows it's contributing to a stack.
+2. Inside the meta-learner: it sees all inputs and residualises.
+
+**Decision:**
+Sub-models emit RAW outputs. The MetaLearner module owns the
+orthogonalisation. Specifically:
+- The first sub-model column (`speed_form_proba`) is the anchor.
+- Every other sub-model column is replaced with its residual after a
+  linear regression against the anchor.
+- `_orthogonalise()` runs as the first step of `_features()`, so both
+  fit and predict apply the same transformation.
+
+**Rationale:**
+- Sub-models stay composable. A `SpeedFormModel.predict_proba` is the
+  best win probability the speed-form model can give — period. Useful
+  on its own, not just inside a stack.
+- The meta-learner is the right place to decide what's redundant: only
+  it sees all 5 outputs together and knows what to anchor against.
+- Swapping meta-learners (logistic regression, MLP, …) doesn't require
+  touching Layer 1. The contract is "Layer 1 emits proba columns;
+  Layer 2 does whatever it wants with them."
+- Stub sub-models (pace, sequence) that return constant 0.5 get zeroed
+  out by orthogonalisation automatically — no special-casing needed.
+
+**Rejected Alternatives:**
+- Push orthogonalisation into each sub-model — rejected (each sub-model
+  would need to know about the other models' presence; tight coupling).
+- Skip orthogonalisation, let LightGBM tree splits handle redundancy —
+  rejected (works empirically but violates CLAUDE.md §2's explicit
+  mandate; deterministic preprocessing is auditable, model-internal
+  feature selection is not).
+
+---
+
+## ADR-026: Untrained Sub-Models Return Constant 0.5
+
+**Date:** 2026-05-12
+**Status:** Accepted (provisional — supersede when models are trained)
+
+**Context:**
+Pace and Sequence sub-models cannot be trained from the current parquet:
+Pace needs fractional time columns (all NULL in source datasets);
+Sequence needs PyTorch + a globally-unique horse_id (currently we collide
+across years/jurisdictions). The bootstrap orchestrator needs to wire
+them in for the meta-learner regardless.
+
+Options:
+1. Don't run the stacker at all until every sub-model is trained.
+2. Use a placeholder column of NaN — meta-learner needs to handle missing.
+3. Use a placeholder constant — meta-learner sees it as constant input.
+
+**Decision:**
+`PaceScenarioModel.predict_proba` and `SequenceModel.predict_proba`
+return `np.full(n, 0.5, dtype=float)`. Their `fit()` raises
+`NotImplementedError`. They have a `predict_proba` because the meta
+needs a column from every slot.
+
+**Rationale:**
+- The ADR-025 orthogonalisation step regresses every sub-model column on
+  the speed_form anchor. A constant column has zero variance → linear
+  regression coefficient is 0 → residual is 0 across all rows → the
+  meta-learner sees a constant 0 input, which has zero gain → it's
+  effectively unused. Same outcome as if the slot didn't exist.
+- 0.5 is the "neutral" placeholder — the expected value of an
+  uninformative prior over P(win). Doesn't bias downstream tools that
+  might consume the raw output before orthogonalisation (e.g., logging
+  / monitoring code that asserts all proba columns are in [0, 1]).
+- Plugging in a trained model later is a single-file change
+  (replace the stub class). No orchestrator edits.
+
+**Rejected Alternatives:**
+- NaN placeholder — rejected (forces every consumer to NaN-guard).
+- Block the stacker until all sub-models train — rejected (would
+  indefinitely delay Phase 4 calibration work behind data acquisition
+  that's out of our control).
+- Always orthogonalise out the stub manually in the orchestrator —
+  rejected (couples the orchestrator to the set of stubs).
+
+---
+
+## ADR-027: Horse Grouping Key is `(horse_name, jurisdiction)` (Compromise)
+
+**Date:** 2026-05-12
+**Status:** Accepted (provisional — see "Future" entry in PROGRESS.md)
+
+**Context:**
+Phase 3 leakage-free feature prep needs to group historical results by
+horse so per-horse priors (EWM speed figure, win rate, days since last)
+are computed over THE SAME horse's history, not across all horses sharing
+a name. The training parquet ships `horse_name` (the
+`horses.name_normalized` column from the master DB), `jurisdiction`,
+and `foaling_year` — but foaling_year is 100% NULL.
+
+Pure-name grouping collides: distinct horses across decades and countries
+sometimes share names (especially common English-language names). The
+master DB's `horses.dedup_key` is globally unique by construction (it
+includes foaling year + country) but is NOT exported in the parquet.
+
+**Decision:**
+`_horse_key(df) = df["horse_name"] + "|" + df["jurisdiction"]`. Documented
+inline in `training_data.py` with a TODO pointing at the proper fix
+(exposing `horses.dedup_key`).
+
+**Rationale:**
+- `(name, jurisdiction)` materially reduces collisions over name-alone:
+  a 2010 UK gelding and a 2015 JP filly with the same registered name
+  no longer share priors. The remaining collisions (same name within the
+  same jurisdiction across decades) are rare enough that they don't
+  dominate training noise.
+- The fix (exposing dedup_key in the export) is a one-liner in
+  `export_training_data.py` — but it requires re-exporting the parquet
+  AND ensuring nothing downstream depends on the current column set.
+  Deferring until Phase 4 lets us land Phase 3 metrics now.
+
+**Rejected Alternatives:**
+- Pure `horse_name` grouping — rejected, too many collisions.
+- Re-export the parquet right now with dedup_key — viable but deferred
+  to avoid mid-phase parquet churn.
+- Synthesize a per-row horse_id during prep by hashing
+  (name|jurisdiction|first_seen_year) — rejected (still collides on
+  shared first-seen year; would mask the bug rather than fix it).
+
+---
+
+## ADR-028: ConnectionsModel Shrinkage Prior Strength α = 30
+
+**Date:** 2026-05-12
+**Status:** Accepted (tunable; default is empirically reasonable)
+
+**Context:**
+The Layer-1d ConnectionsModel uses a beta-binomial empirical-Bayes
+estimator: per-jockey, per-trainer, and per-pair win rates are shrunk
+toward the per-jurisdiction baseline by an additive pseudo-count `α`.
+`α` is the model's central hyperparameter — too small and a 1-for-1
+jockey looks like 100% win rate; too large and elite riders look average.
+
+**Decision:**
+`ConnectionsConfig.prior_strength = 30.0` by default.
+
+**Rationale:**
+- Interpretation: "act as if you've already observed 30 races at the
+  baseline rate before trusting any new evidence." With baseline
+  ≈ 8.5% (the actual global win rate in the training parquet), the
+  prior contributes ≈ 2.55 pseudo-wins toward the shrunken numerator.
+- Empirically, this puts the per-jockey rates in a believable range:
+  veteran jockeys with 500+ starts express their true rate; rookies
+  with 5 starts barely deviate from baseline. Mean shrunken rate across
+  all jockeys is within 0.5% of the jurisdiction baseline — the
+  shrinkage isn't biasing en masse, just damping outliers.
+- Phase 4 calibration will surface whether the meta-learner benefits
+  from a stronger or weaker prior here. Until then, α = 30 is a safe
+  starting point.
+
+**Rejected Alternatives:**
+- α = 10 (less shrinkage) — rejected after spot-checks showed top-10
+  jockeys with high win rates over single-digit start counts.
+- α = 100 (more shrinkage) — rejected; effectively neuters the model
+  by pulling everyone to baseline.
+- Per-jurisdiction α — rejected for now (premature; jurisdictions have
+  different start-count distributions but the constant α at this
+  magnitude doesn't materially mistreat any of them).
+- Full PyMC hierarchical model — deferred to Phase 4 (the
+  empirical-Bayes version captures most of the signal at a fraction of
+  the implementation complexity).
+
+---
+
+## ADR-029: Leakage-Free Feature Prep via `groupby.shift(1)` Before Every Rolling Aggregate
+
+**Date:** 2026-05-12
+**Status:** Accepted (implements CLAUDE.md §2 train/val isolation mandate)
+
+**Context:**
+CLAUDE.md §2 requires time-based train/val splits. But split-level
+time-isolation alone is insufficient: if a per-row feature accidentally
+includes the row's own race outcome (e.g., EWM speed of all that horse's
+races including today's), the model can perfectly learn the target from
+the feature within the training set, then fail on validation.
+
+Specifically: the parquet has one row per historical horse-race result.
+For each row, the per-horse rolling features must use ONLY rows with
+strictly earlier dates for that horse.
+
+**Decision:**
+`prepare_training_features` enforces leakage-free aggregates uniformly:
+every per-horse rolling/EWM aggregate is computed via
+`df.groupby('horse_key')['col'].transform(lambda s: s.shift(1).rolling(...).foo())`.
+The `shift(1)` step happens INSIDE the lambda before the rolling/EWM, so
+the value at row i depends only on rows 0..i-1.
+
+A dedicated test (`test_prepare_features_no_leakage_first_row_per_horse_has_null_priors`)
+asserts that for the first start of every horse, every `*_prior` column
+is NaN — which can only be true if the shift(1) is actually wired up.
+
+**Rationale:**
+- Catching leakage at the feature level is critical. By the time it
+  shows up in val metrics it's too late: the entire training run
+  upstream of validation is suspect.
+- The `_prior` suffix on every leakage-controlled column is part of the
+  public contract — any future column added to the feature set must
+  follow the same suffix-and-shift discipline. The test enforces it.
+- A future Phase 4 reliability-diagram report can sanity-check that
+  the val log-loss is consistent with the train log-loss (they should
+  differ by a few percent, not by orders of magnitude) — a large gap
+  is a leakage indicator.
+
+**Rejected Alternatives:**
+- Compute features without the shift and rely on time-split alone to
+  catch leakage — rejected (would only catch it on validation, and
+  diagnosing post-hoc is painful).
+- Use a separate "as_of" framework / library (e.g. featuretools) —
+  rejected (overkill for the row-level shift this needs; adds a
+  dependency for negligible gain).
+- Drop the first row of every horse from training (no priors available) —
+  rejected (the model should learn FTS behaviour; dropping them is a
+  separate, opt-in toggle via `drop_first_starts=True`).
