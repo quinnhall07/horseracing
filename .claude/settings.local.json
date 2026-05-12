@@ -15,7 +15,10 @@
       "Bash(git -C /c/Users/danie/Documents/GitHub/horseracing check-ignore -v .venv)",
       "Bash(git -C /c/Users/danie/Documents/GitHub/horseracing config --get core.excludesfile)",
       "Bash(git -C /c/Users/danie/Documents/GitHub/horseracing status)",
-      "Bash(git -C /c/Users/danie/Documents/GitHub/horseracing ls-files --others --exclude-standard --directory)"
+      "Bash(git -C /c/Users/danie/Documents/GitHub/horseracing ls-files --others --exclude-standard --directory)",
+      "Bash(python *)",
+      "Bash(tasklist /FI \"IMAGENAME eq python.exe\")",
+      "PowerShell(Get-Process *)"
     ]
   }
 }

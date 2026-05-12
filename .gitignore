@@ -47,3 +47,22 @@ artifacts/
 data/raw/
 data/processed/
 data/interim/
+
+# ── Phase 0 data pipeline ───────────────────────────────────────────────────
+# Per CLAUDE.md §4: staging is raw downloads, never committed. Cleaned
+# accepted parquet is large + reproducible. DB files are gitignored.
+# `rejected/` IS committed — it documents data quality issues over time.
+data/staging/
+data/cleaned/*/all.parquet
+data/cleaned/*/accepted/
+data/cleaned/*/rejected_pydantic.jsonl
+data/exports/
+data/db/
+!data/cleaned/*/rejected/
+!data/cleaned/*/rejected/reasons.jsonl
+!data/cleaned/*/rejected/all.parquet
+
+# Kaggle credentials should never be committed.
+*.kaggle.json
+kaggle.json
+.kaggle/

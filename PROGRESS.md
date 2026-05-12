@@ -7,13 +7,184 @@ Format: newest session at the top.
 
 ## Current State
 
-**Phase:** 1 — PDF Ingestion Pipeline
-**Last completed task:** Phase 1 parser test suite (172 tests, all passing) + parser bugfixes surfaced by tests
-**Next task:** Project bootstrap (`app/core/logging.py`, `app/main.py`, `app/api/v1/ingest.py`, `app/db/`, `.env.example`) — then validate end-to-end against a real Brisnet PDF
+**Phase:** 0 — Master Training Database (code complete; ready for live run) + Phase 1 — PDF Ingestion (paused at scaffolding milestone)
+**Last completed task:** `auto_ingest.py` — Kaggle-keyword-driven bulk discovery + ingestion orchestrator; dry-run successfully surfaced 38 unique candidate datasets across 6 keywords (~3.4 GB total).
+**Next task:** User runs `python scripts/db/auto_ingest.py --auto-map --username quinnhall07` to bulk-load discovered datasets. Audit via `dedup_report.py`, then export training parquet. After that: resume Phase 1 bootstrap (`app/core/logging.py`, `app/main.py`, `app/api/v1/ingest.py`, `app/db/`).
 
 ---
 
 ## Session Log
+
+### Session: 2026-05-11 (c) — Auto-discovery ingestion + bug fixes
+
+**Completed:**
+- `scripts/db/auto_ingest.py` — Kaggle-keyword-driven bulk orchestrator. Searches Kaggle
+  for configurable keywords (default: "horse racing", "horse bet", "horseracing", "horse
+  race results", "thoroughbred", "horse betting"), deduplicates results across keywords,
+  and runs each unique slug through the full pipeline:
+  download → evaluate → map+clean → quality_gate → load. Skips slugs already present
+  in the `datasets` table (idempotent). Emits a structured per-slug `SlugResult` with
+  status codes: `loaded` / `already_ingested` / `low_score` / `needs_map` / `no_csv` /
+  `error`.
+- Two field-map modes: **strict** (default) processes only datasets with a hand-written
+  entry in `field_maps.FIELD_MAPS`; for unregistered slugs it logs the actual CSV column
+  names so you can write a new entry and re-run. **`--auto-map`** opt-in builds a
+  synthetic field map at runtime via the heuristic regex matchers from
+  `evaluate_dataset.py`. Heuristic mode is intentionally lossy and the user is told to
+  inspect `rejected/reasons.jsonl` after each run.
+- True `--dry-run` mode — discovery only, zero downloads, zero DB writes. Returns a
+  preview list with Kaggle metadata (size, downloads, votes, last_updated, url,
+  matched_keyword) plus `already_ingested` and `has_field_map` flags per slug.
+- No automatic cleanup — staging/cleaned/parquet artifacts are retained on disk for
+  audit (per user preference; trades disk space for debuggability).
+
+**Bug fixes (surfaced by smoke tests + dry-run):**
+- `evaluate_dataset._HEURISTICS` regex `\b` boundaries did not fire on snake_case
+  columns. Python's `\b` is a transition between `\w` (which includes `_`) and `\W`,
+  so `\b(date)\b` cannot match `race_date` (no boundary between `e` and `_`). Fixed
+  by replacing `\b` with explicit lookarounds `(?<![a-zA-Z0-9])...(?![a-zA-Z0-9])`,
+  which treat `_` as a separator. This was breaking heuristic mapping for the majority
+  of real Kaggle datasets.
+- Initial `auto_ingest.discover_slugs` mis-used Kaggle's `dataset_list(max_size=N)` —
+  `max_size` is a **byte-size filter** (max bytes per dataset), not a result-count cap.
+  My first dry-run returned only 1 result because I was filtering to datasets ≤ 20
+  bytes. Fixed by replacing `max_size` with proper page-by-page iteration via
+  `_search_paginated` until `max_per_keyword` results are accumulated.
+- Initial `--dry-run` flag was a no-op at the CLI level — it still downloaded every
+  dataset and wrote `datasets` rows to the DB before bailing. Restructured so dry-run
+  short-circuits at the orchestration level (in `auto_ingest()`) and returns
+  discovery-only results without entering the per-slug processing loop.
+
+**Dry-run Findings:**
+- 38 unique horse-racing datasets discovered; estimated ~3.4 GB total download
+- **None of the 3 datasets currently registered in `field_maps.py`
+  (`joebeachcapital/horse-racing`, `zygmunt/horse-racing-dataset`,
+  `gdaley/horseracing-in-hk`) appeared in the search results** — they may have been
+  renamed or removed. `gdaley/hkracing` did appear and is likely the renamed HK
+  dataset. The DATA_PIPELINE.md §4 dataset catalog needs updating.
+- High-quality candidates by community signal (downloads):
+  `gdaley/hkracing` (9628 dl), `lantanacamara/hong-kong-horse-racing` (5429 dl),
+  `hwaitt/horse-racing` (5091 dl), `takamotoki/jra-horse-racing-dataset` (3159 dl),
+  `deltaromeo/horse-racing-results-ukireland-2015-2025` (2780 dl, 1.1 GB),
+  `eonsky/betfair-sp` (1016 dl, 1.2 GB)
+- Junk that will be auto-rejected:
+  `seniruepasinghe/horse-racing-player-detection-yolo11` (image dataset → no_csv),
+  `thedevastator/major-us-sports-venues-usage-and-affiliations`,
+  `quantumgoat/predict-horse-price`, several "winners-only" tiny datasets
+
+**Key Decisions Made:** (full rationale in DECISIONS.md ADR-013, ADR-014)
+- Auto-ingest uses a **hybrid mode**: strict by default for data-quality safety,
+  `--auto-map` opt-in for bulk-build velocity. Both modes leave the DB in a clean state.
+- Dry-run is **discovery-only** (no downloads, no DB writes). Two tiers of "preview"
+  rejected — single tier with explicit followup is simpler.
+- Heuristic auto-mapping uses **column-name regex only**; no value sniffing for unit
+  detection. Distance is assumed already in furlongs; odds assumed already decimal.
+  Quality gate's range checks (2.0-20.0 furlongs, 1.0+ decimal odds) are the
+  unit-mismatch safety net.
+
+**Tests Status:**
+- 233 tests passing in ~2.9s (172 Phase 1 + 61 Phase 0). No new tests for `auto_ingest.py`
+  itself — it's an orchestration layer over fully-tested components, and stubbing the
+  Kaggle API would be more cost than value.
+
+---
+
+### Session: 2026-05-11 (b) — Phase 0 master DB pipeline (code complete)
+
+**Completed:**
+- `pyproject.toml` — added Phase 0 deps: `kaggle>=1.6`, `pandas>=2.2`, `pyarrow>=15.0`
+- `scripts/db/schema.sql` — 7 idempotent CREATE TABLE / CREATE INDEX statements
+  (datasets, tracks, races, horses, jockeys, trainers, race_results) with UNIQUE(dedup_key)
+  on every dedup target
+- `scripts/db/constants.py` — paths, schema version, quality thresholds, source priority dict
+- `scripts/db/setup_db.py` — runs schema.sql via `executescript`; idempotent (re-runs are no-ops)
+- `scripts/db/dedup.py` — SHA-256 dedup keys per DATA_PIPELINE.md §3:
+  `race_dedup_key` (track|date|race#|round(distance,2)|surface),
+  `horse_dedup_key` (normalized_name|year|country, with "unknown" fallbacks),
+  `person_dedup_key` (jockeys/trainers — normalized_name|jurisdiction),
+  `result_dedup_key` (race_key|horse_key)
+- `scripts/db/transformers.py` — full unit-conversion library (metres↔furlongs, UK distance
+  parser supporting `1m4f 110y`, stones↔lbs, fractional/EVS odds, UK SP with favourite-marker
+  stripping, surface/condition normalization including all-weather track recognition,
+  time-string parser, fixed-rate FX). All transformers return None on garbage rather than
+  raising — quality gate is the gatekeeper.
+- `scripts/db/field_maps.py` — registry for joebeachcapital/horse-racing (US, active),
+  zygmunt/horse-racing-dataset (UK, drafted), gdaley/horseracing-in-hk (HK, drafted).
+  Value semantics: `"col"` = column ref, `{"const": v}` = literal, `None` = NULL
+- `scripts/db/schemas.py` — Pydantic v2 canonical models: `CanonicalRace`, `CanonicalHorse`,
+  `CanonicalPerson` (jockeys/trainers share shape), `CanonicalRaceResult` with nested
+  race/horse/jockey/trainer + `to_parquet_dict()` flattener (parent prefixes for nested fields)
+- `scripts/db/ingest_kaggle.py` — Kaggle download + `datasets` table registration with
+  4-tier credential resolution: `--credentials` path → env vars → `~/.kaggle/kaggle.json` →
+  `~/.kaggle/access_token` (JSON or raw key). Writes `_dataset_id` sidecar in staging dir
+  so downstream scripts can pick up the FK without re-running.
+- `scripts/db/evaluate_dataset.py` — DATA_PIPELINE.md §6 rubric (weighted score, threshold
+  0.70). Heuristic regex column matching when no `--slug`; field-map lookup when slug given.
+  Emits JSON report (score, field_coverage, jurisdiction_guess, warnings, date range,
+  estimated races/results).
+- `scripts/db/map_and_clean.py` — staging CSV → CanonicalRaceResult validation → parquet.
+  Writes `cleaned/<slug>/all.parquet` (every row that passes Pydantic) plus
+  `rejected_pydantic.jsonl` for diagnostics. Lenient — only rejects on hard schema
+  failures; quality gate handles the rest.
+- `scripts/db/quality_gate.py` — DATA_PIPELINE.md §8 scoring + cross-row race-level
+  validation (multiple winners, mixed distances/surfaces, duplicate horses). Splits parquet
+  into `accepted/all.parquet` and `rejected/all.parquet` + `reasons.jsonl`. Sets
+  `data_quality_score` on every row before split.
+- `scripts/db/load_to_db.py` — idempotent loader: dependency-ordered upserts
+  (horses → jockeys → trainers → races → race_results) with `INSERT OR IGNORE` on
+  every dedup_key. Updates `datasets.row_count_ingested/deduped/date_range_*` after each load.
+- `scripts/db/dedup_report.py` — per-table totals + duplicate-key counts (must always be 0)
+  + race_results quality-score distribution + dataset audit-trail summary.
+- `scripts/db/export_training_data.py` — runs DATA_PIPELINE.md §12 SQL verbatim, parametrized
+  by `--min-score` and `--min-field-size`, writes `data/exports/training_<YYYYMMDD>.parquet`.
+
+**Test Suite (61 new tests, 233 total passing):**
+- `tests/test_db/test_dedup.py` — 11 tests: hash stability across `date`/string inputs,
+  case-insensitivity, distance rounding, distinguishing collisions, name normalization
+- `tests/test_db/test_transformers.py` — 27 tests: every transformer's happy path,
+  None-on-garbage contract, registry consistency, field_maps→transformer registry validation
+- `tests/test_db/test_quality_gate.py` — 20 tests: every hard failure (parametrized),
+  every soft penalty (exact deduction values), every range check, score clamping at 0,
+  cross-row violations (multiple winners, mixed distances, duplicate horses)
+- `tests/test_db/test_pipeline.py` — 3 end-to-end tests: synthetic CSV through full
+  pipeline; quality_score persisted; dedup keys stable across re-runs (idempotency)
+
+**Schema Adjustment:**
+- `CanonicalRace.distance_furlongs` / `surface` / `jurisdiction` made `Optional` so
+  map_and_clean produces all rows for the quality gate to score (rather than dropping
+  rows with missing soft fields at Pydantic validation time). The quality gate then
+  treats these as load-required hard failures (zero score) — they're NOT NULL in SQL
+  and used in the race dedup key, so a row missing them is fundamentally unloadable.
+
+**Key Decisions Made:**
+- `scripts/db/` is fully standalone — no imports from `app/`. Per CLAUDE.md §11, this
+  keeps the training pipeline runnable without standing up FastAPI.
+- stdlib `sqlite3` instead of SQLAlchemy in `scripts/db/` — Phase 0 has no async
+  requirements and the schema is small enough that ORM overhead is pure cost.
+- Bootstrap pattern in every CLI script: `if __package__ in (None, ""): sys.path.insert(0, ...)`
+  so all scripts work as both `python scripts/db/foo.py` and `python -m scripts.db.foo`.
+- Field-map value `{"const": value}` syntax disambiguates literal values from column
+  references — small deviation from DATA_PIPELINE.md §5 sketch (which inlined raw
+  values) but cleaner because it avoids clobbering valid column names like `"beyer"`.
+- Source priority logic (Equibase > Brisnet > DRF > Kaggle) is enforced implicitly via
+  `INSERT OR IGNORE`: whichever dataset is loaded first wins. To override, drop the
+  conflicting row from the lower-priority dataset and re-run. (Future improvement: add
+  an explicit `source_priority` column and a per-table `MERGE`-style upsert.)
+- `quality_gate.py` adds a load-required hard-failure on missing distance/surface/
+  jurisdiction even though DATA_PIPELINE.md §8 calls them soft failures — these fields
+  are required for the race dedup key + SQL load, so they cannot be soft.
+
+**Not Started (Phase 0 remaining — runtime work, not code):**
+- Live run against `joebeachcapital/horse-racing`: download via `ingest_kaggle.py`,
+  evaluate, map+clean (will surface CSV column-name mismatches with the field map —
+  these go straight back into `field_maps.py`), quality-gate, load.
+- After load: confirm `dedup_report.py` shows zero duplicate keys and a sane score
+  distribution; run `export_training_data.py` and inspect the parquet.
+
+**Tests Status:**
+- 233 tests passing in ~3.0s. Run with `.venv/Scripts/python.exe -m pytest tests/ -q`.
+
+---
 
 ### Session: 2026-05-11 — Phase 1 parser test suite
 
@@ -133,6 +304,28 @@ Format: newest session at the top.
 ---
 
 ## Phase Completion Checklist
+
+### Phase 0: Master Training Database
+- [x] `scripts/db/schema.sql`
+- [x] `scripts/db/constants.py`
+- [x] `scripts/db/setup_db.py`
+- [x] `scripts/db/dedup.py`
+- [x] `scripts/db/transformers.py`
+- [x] `scripts/db/field_maps.py`
+- [x] `scripts/db/schemas.py`
+- [x] `scripts/db/ingest_kaggle.py`
+- [x] `scripts/db/evaluate_dataset.py`
+- [x] `scripts/db/map_and_clean.py`
+- [x] `scripts/db/quality_gate.py`
+- [x] `scripts/db/load_to_db.py`
+- [x] `scripts/db/dedup_report.py`
+- [x] `scripts/db/export_training_data.py`
+- [x] `scripts/db/auto_ingest.py` (Kaggle keyword-driven bulk orchestrator)
+- [x] `tests/test_db/test_dedup.py` (11 tests)
+- [x] `tests/test_db/test_transformers.py` (27 tests)
+- [x] `tests/test_db/test_quality_gate.py` (20 tests)
+- [x] `tests/test_db/test_pipeline.py` (3 end-to-end tests)
+- [ ] Live run: ingest joebeachcapital/horse-racing → load → export training parquet
 
 ### Phase 1: PDF Ingestion
 - [ ] `app/core/config.py` — scaffold only; full BaseSettings present but logging/db settings unused yet

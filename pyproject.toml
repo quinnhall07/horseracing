@@ -10,14 +10,19 @@ requires-python = ">=3.11"
 readme = "README.md"
 license = { text = "Proprietary" }
 
-# Runtime dependencies for the PDF ingestion pipeline (Phase 1).
-# Heavier ML deps (lightgbm, torch, scipy) are added in later phases.
+# Runtime dependencies for the PDF ingestion pipeline (Phase 1) and the
+# Phase 0 data pipeline (scripts/db/). Heavier ML deps (lightgbm, torch,
+# scipy) are added in later phases.
 dependencies = [
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
     "structlog>=24.1",
     "pdfplumber>=0.11",
     "pypdf>=4.2",
+    # Phase 0 — Kaggle ingestion + tabular data handling.
+    "kaggle>=1.6",
+    "pandas>=2.2",
+    "pyarrow>=15.0",
 ]
 
 [project.optional-dependencies]

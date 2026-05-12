@@ -240,3 +240,218 @@ is wrong — this is the single most important correctness property of the pipel
   would be completely wrong)
 - Platt only — rejected (fails on asymmetric distortions)
 - Isotonic only — rejected (unstable on small validation sets)
+
+---
+
+## ADR-009: Phase 0 Pipeline is Standalone — No `app/` Imports, stdlib `sqlite3`
+
+**Date:** 2026-05-11
+**Status:** Accepted
+
+**Context:**
+Phase 0 (master DB build) needs to be runnable independently of FastAPI. The training
+corpus is the foundation of every downstream model — it must be reproducible from a
+clean checkout without standing up the full backend.
+
+**Decision:**
+- `scripts/db/` imports only from `scripts/db/` itself. Zero dependency on `app/`.
+- Database access uses stdlib `sqlite3` directly, not the SQLAlchemy async ORM that
+  `app/db/` will use in production.
+- All scripts work as both `python scripts/db/foo.py` (file invocation) and
+  `python -m scripts.db.foo` (module invocation) via a bootstrap pattern at the top
+  of every CLI script.
+
+**Rationale:**
+Phase 0 has no async requirements (it's a one-shot batch pipeline), and the schema
+is small enough that ORM overhead is pure cost. Keeping it standalone means a Phase 0
+re-run never blocks on a backend bug, and the training pipeline can be moved to a
+separate CI job or VM without dragging the FastAPI surface along.
+
+**Rejected Alternatives:**
+- Share `app/db/models.py` SQLAlchemy schemas — rejected (couples build pipeline to
+  backend startup; async-only ORM is wrong tool for a sync batch script).
+- Build a third shared package — rejected (premature abstraction; two consumers don't
+  justify a layer).
+
+---
+
+## ADR-010: Field-Map Registry With `{"const": v}` Literal Disambiguation
+
+**Date:** 2026-05-11
+**Status:** Accepted
+
+**Context:**
+Each Kaggle dataset uses different column names (`track` vs `trackname` vs `course`).
+We need a registry that says "for this dataset, the canonical `track_code` field comes
+from CSV column X". Some canonical fields don't have a column source at all — they're
+constant per dataset (e.g., `speed_figure_source = "beyer"` for the joebeachcapital
+dataset, since the entire dataset uses Beyer figures).
+
+**Decision:**
+Field-map values use a small DSL:
+- `"col_name"` (string) → copy from CSV column
+- `{"const": value}` (dict) → use the literal value for every row
+- `None` → leave the canonical field NULL
+
+Stored in `scripts/db/field_maps.py` as the `FIELD_MAPS` dict, keyed by Kaggle slug.
+
+**Rationale:**
+DATA_PIPELINE.md §5 sketched the registry with raw inline literals, e.g.
+`"speed_figure_source": "beyer"`. That conflates two ideas: "this canonical field
+comes from a column called 'beyer'" vs "this canonical field is always literally
+'beyer'". The `{"const": v}` wrapper is verbose but unambiguous, and prevents
+silent breakage if some future dataset has a CSV column literally named "beyer".
+
+**Rejected Alternatives:**
+- Inline literals (the DATA_PIPELINE.md sketch) — rejected (ambiguous).
+- Separate `constants` dict alongside `race_fields` — rejected (introduces a third
+  resolution path for one extra concept; the wrapper is cleaner).
+
+---
+
+## ADR-011: Quality Gate is the Sole Loadability Arbiter, With Load-Required Hard-Failures
+
+**Date:** 2026-05-11
+**Status:** Accepted
+
+**Context:**
+DATA_PIPELINE.md §8 distinguishes hard failures (missing race_date / track_code /
+horse_name / finish_position → score 0.0) from soft failures (missing distance:
+-0.20, missing surface: -0.15, etc.). But `distance_furlongs`, `surface`, and
+`jurisdiction` are `NOT NULL` in the SQL schema and used in the race dedup key. A
+row missing them cannot be persisted at all — even though the spec calls them soft.
+
+**Decision:**
+- Pydantic canonical schemas (`scripts/db/schemas.py`) are intentionally permissive:
+  these fields are `Optional` so map_and_clean produces all rows for the quality gate
+  to score (rather than dropping rows at validation time).
+- Quality gate (`scripts/db/quality_gate.py`) treats missing
+  `distance_furlongs` / `surface` / `jurisdiction` as **load-required hard
+  failures** (zero score) — overriding the spec's soft classification.
+- This guarantees that anything quality_gate accepts is loadable.
+- `load_to_db.py` keeps a defensive belt-and-suspenders check (also skips rows with
+  `None` for these three) for safety.
+
+**Rationale:**
+Treating these as soft per the spec means a row could pass the 0.60 threshold with
+all three missing (1.0 - 0.20 - 0.15 = 0.65) and then fail at SQL load with an
+opaque NOT NULL error. Failing them at the quality gate is semantically correct
+(the row has no identity for dedup) and emits a clear rejection reason in
+`rejected/reasons.jsonl`.
+
+**Rejected Alternatives:**
+- Follow spec literally; let load_to_db crash/skip — rejected (silent data loss
+  with no rejection reason logged; test suite would need to assert on a SQL error).
+- Default missing values to placeholders (`distance=0.0`, `surface="unknown"`) —
+  rejected (would corrupt the dedup key — every "unknown" row would collide).
+
+---
+
+## ADR-012: SHA-256 Dedup Keys Are Frozen DB Contract
+
+**Date:** 2026-05-11
+**Status:** Accepted
+
+**Context:**
+DATA_PIPELINE.md §3 specifies exact hash inputs for race / horse / person / result
+dedup keys. The exact byte-string fed into `hashlib.sha256()` is part of the database
+contract — changing it produces different hashes for the same logical entity, which
+silently invalidates every existing row's idempotency.
+
+**Decision:**
+- Hash input formulas in `scripts/db/dedup.py` are frozen.
+- `tests/test_db/test_dedup.py` asserts hash stability across several invariants
+  (date-vs-string input equivalence, case insensitivity, two-decimal distance
+  rounding) so a refactor cannot silently break the contract.
+- Any change to hash inputs requires bumping `SCHEMA_VERSION` in
+  `scripts/db/constants.py`. Different SCHEMA_VERSION values create separate dataset
+  rows, so old + new keys can coexist during a migration.
+
+**Rationale:**
+Idempotency is the single most important property of the build pipeline (DATA_PIPELINE.md
+§1, "running it twice on the same source produces the same DB state"). If the hash
+formula changes, a re-run sees zero matches and inserts the entire dataset again —
+silently doubling every row. The frozen contract + test guard makes this a loud
+failure instead.
+
+**Rejected Alternatives:**
+- Hash all available row data (more "robust") — rejected (any column with mild
+  variance like timestamps would cause the same logical entity to hash differently).
+- Use natural keys instead of hashes — rejected (composite UNIQUE indexes work but
+  produce verbose schemas and slower equality checks at the volumes we expect; also
+  doesn't help with cross-source merging).
+
+---
+
+## ADR-013: Auto-Ingest Uses Hybrid Strict + `--auto-map` Modes (Not One or the Other)
+
+**Date:** 2026-05-11
+**Status:** Accepted
+
+**Context:**
+`auto_ingest.py` discovers Kaggle datasets via keyword search, but most discovered
+slugs have no hand-written field map in `field_maps.py`. Two extremes:
+- **Strict only:** refuse to process any unmapped slug. Safest data quality, slowest
+  corpus growth — every new dataset requires manual field-map authoring before any
+  data lands in the DB.
+- **Heuristic only:** always build a synthetic field map from column-name regexes.
+  Fastest corpus growth, lowest data quality — heuristics silently mismap fields
+  (e.g., picks `horse_id` as `horse_name` because both contain "horse"), and the
+  user has no way to opt into strict for a careful first run.
+
+**Decision:**
+Both behaviors live behind a single `--auto-map` flag:
+- Default (no flag) is **strict** — unmapped slugs return status `needs_map` with
+  the actual CSV column names logged so the user can write a new entry.
+- `--auto-map` activates the heuristic builder for unmapped slugs.
+- In both modes, registered field maps in `FIELD_MAPS` always win over the heuristic.
+
+**Rationale:**
+The two modes serve genuinely different workflows. Early in corpus building, the
+user wants `--auto-map` for bulk velocity even at the cost of some mismapped rows
+(which the quality gate's range checks catch as low-scoring rejects). Later, when
+the corpus is mature and adding new sources requires careful curation, strict mode
+is the right default. Forcing one or the other would force the user to re-implement
+the missing mode out-of-band.
+
+**Rejected Alternatives:**
+- Strict only — rejected (corpus growth would block on hand-mapping every new dataset
+  found via search).
+- Heuristic only — rejected (no escape hatch for the user who wants to inspect a
+  novel dataset's columns before letting the heuristic guess).
+- Per-keyword mode flag — rejected (overengineered; the global flag is simpler and
+  the user can always run twice with different keyword sets).
+
+---
+
+## ADR-014: `--dry-run` is Discovery-Only — No Downloads, No DB Writes
+
+**Date:** 2026-05-11
+**Status:** Accepted
+
+**Context:**
+The first implementation of `--dry-run` short-circuited at the very end of
+`process_slug` — it still downloaded every dataset (potentially many GB) and wrote
+`datasets` rows to the DB before bailing. That violated user expectations of what
+"dry run" means and made the flag actively dangerous.
+
+**Decision:**
+Dry-run short-circuits at the orchestration level (in `auto_ingest()`) before any
+per-slug work begins. It calls `discover_slugs_with_metadata()` and returns a
+discovery-only result that includes Kaggle metadata (size, downloads, votes,
+last_updated, url) plus per-slug flags (`already_ingested`, `has_field_map`).
+No staging directories created; no `datasets` rows written.
+
+**Rationale:**
+A dry-run that touches disk and the DB is a bug, not a feature. Users invoke
+`--dry-run` precisely to preview what the real run would do without committing
+side effects. The Kaggle metadata in the preview output (especially dataset size
+in MB) is what enables the user to make an informed go/no-go decision before
+spending the bandwidth.
+
+**Rejected Alternatives:**
+- "Preview-and-evaluate" mode that downloads but skips load — rejected (hides the
+  largest cost — bandwidth — from the preview).
+- Two flags: `--list-only` vs `--no-load` — rejected (the second tier of preview
+  has no clear use case; the user can always run for real and inspect each
+  step's parquet output if they want intermediate inspection).
