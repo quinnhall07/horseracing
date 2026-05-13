@@ -99,10 +99,18 @@ def evaluate_calibration(
     test_labels: np.ndarray,
     label: str,
     n_bins: int = 15,
+    inner_val_indices: Optional[np.ndarray] = None,
 ) -> tuple[Calibrator, CalibrationReport]:
-    """Fit a Calibrator on (calib_scores, calib_labels), evaluate on test."""
+    """Fit a Calibrator on (calib_scores, calib_labels), evaluate on test.
+
+    `inner_val_indices` (optional): time-ordered tail of the calib slice
+    to use as the inner-val set for auto-selection. Recommended in the
+    live pipeline since the test slice immediately follows the calib
+    slice in time and the model improves over time (older calib rows
+    are not exchangeable with newer test rows). See ADR-038.
+    """
     cal = Calibrator(CalibratorConfig(method="auto", n_bins_for_selection=n_bins))
-    cal.fit(calib_scores, calib_labels)
+    cal.fit(calib_scores, calib_labels, inner_val_indices=inner_val_indices)
 
     pre_test = test_scores
     post_test = cal.predict_proba(test_scores)
@@ -283,12 +291,27 @@ def run_live(
     meta_calib_p = meta.predict_proba(calib_stacked)
     meta_test_p = meta.predict_proba(test_stacked)
 
+    # Time-ordered inner-val indices (last 20% of the calib slice by date).
+    # The model improves over time, so the calib slice and test slice are
+    # not exchangeable — the tail of the calib slice is the closest
+    # in-distribution proxy for the test slice. See ADR-038.
+    sorted_calib_idx = calib["race_date"].argsort().to_numpy()
+    inner_val_size = max(1, int(0.2 * len(sorted_calib_idx)))
+    inner_val_idx = sorted_calib_idx[-inner_val_size:]
+    log.info(
+        "validate.inner_val",
+        n_inner_val=int(len(inner_val_idx)),
+        inner_val_start=str(calib["race_date"].iloc[inner_val_idx].min()),
+        inner_val_end=str(calib["race_date"].iloc[inner_val_idx].max()),
+    )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     summary: dict = {
         "input": str(input_path),
         "models_dir": str(models_dir),
         "n_calib": int(len(calib)),
         "n_test": int(len(test)),
+        "n_inner_val": int(len(inner_val_idx)),
         "calib_cutoff": str(calib_cutoff),
         "test_cutoff": str(test_cutoff),
         "models": {},
@@ -304,6 +327,7 @@ def run_live(
             test_scores=np.asarray(test_p),
             test_labels=test["win"].to_numpy(),
             label=label,
+            inner_val_indices=inner_val_idx,
         )
         cal_dir = output_dir / label
         cal.save(cal_dir)

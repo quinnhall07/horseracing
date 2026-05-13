@@ -1559,3 +1559,209 @@ we should investigate per-jurisdiction calibration.
   ~17k races, the IID-with-race assumption is already mild and the
   added complexity isn't worth it for an automated selection knob).
 
+## ADR-038: Skip-When-Calibrated Guard + Time-Ordered Inner-Val (Refines ADR-037)
+
+**Date:** 2026-05-13
+**Status:** Accepted (refines ADR-037 — does NOT supersede it).
+Refined the same day to add a strictly-proper Brier co-criterion to
+the skip check after the post-fix full-parquet run showed isotonic
+genuinely winning on inner-val ECE while only redistributing
+probability across bins (post-cal test ECE > pre-cal test ECE; test
+Brier essentially unchanged).
+
+**Context:**
+ADR-037 fixed the auto-selector's selection criterion (held-out
+inner-val ECE instead of fit-slice ECE), but the post-fix full-parquet
+run revealed two remaining problems:
+
+1. **Selection bias is fixed; degradation persists.** On the full
+   parquet, the held-out auto-selector correctly identifies isotonic
+   as the inner-val winner (delta ≈ 20× the min_delta_ece threshold).
+   But the chosen calibrator still degrades test-slice ECE from
+   ≈ 0.003 raw to ≈ 0.005-0.006 post-cal. Root cause: time-
+   distribution shift. The model improves over time, so the calib
+   slice (older years) is more miscalibrated than the test slice
+   (newer years). Calibration fitted on the older window adds noise
+   on the newer test data.
+
+2. **No way to skip calibration entirely.** When raw scores are
+   already well-calibrated probabilities (the meta-learner's output
+   on this dataset is one such case), ANY learned calibration map
+   adds variance without removing bias — the optimal calibration
+   map is the identity. The previous selector could only choose
+   between Platt and isotonic.
+
+**Decision:**
+Two complementary refinements to `Calibrator.fit` under `method='auto'`:
+
+1. **Skip-when-calibrated guard (`skip_threshold_delta`, default 0.001;
+   `brier_skip_delta`, default 1e-4):**
+   The auto-selector computes raw inner-val ECE AND Brier alongside
+   Platt and isotonic. Calibration applies only if the winning method
+   beats raw on BOTH metrics by the configured deltas. Otherwise
+   `chosen_method = 'identity'` and `predict_proba` returns raw
+   scores clipped to [0, 1].
+
+       method_winner = isotonic_or_platt_per_min_delta_rule
+       winner_ece, winner_brier = (iso or platt) per the above rule
+       ece_beats   = winner_ece   + skip_threshold_delta < raw_ece
+       brier_beats = winner_brier + brier_skip_delta     < raw_brier
+       chosen = method_winner if (ece_beats AND brier_beats) else 'identity'
+
+   The Brier co-criterion is essential: ECE is a binned summary that
+   noise can game by redistributing probability across bins (no real
+   accuracy improvement, but ECE drops). Brier is strictly proper —
+   its minimum is achieved only at the true distribution. Requiring
+   both rules out the case observed on the full parquet, where
+   isotonic genuinely won on inner-val ECE (delta ≈ 4× threshold)
+   yet had no measurable Brier improvement on either inner-val or
+   test, and produced strictly worse test ECE post-cal.
+
+2. **Time-ordered inner-val support (`inner_val_indices` parameter):**
+   `Calibrator.fit(scores, labels, inner_val_indices=...)` accepts
+   explicit row indices to use as the inner-val slice instead of an
+   internal seeded random shuffle. Callers should pass the
+   time-ordered TAIL of the calib slice (e.g. last 20% of calib by
+   `race_date`). The tail is the closest in-distribution proxy for
+   the test slice, which immediately follows the calib slice in
+   time. `validate_calibration.py` does this automatically.
+
+   Selection mode reflects the source: `held_out_caller` for
+   caller-supplied indices, `held_out` for seeded random shuffle,
+   `fit_slice_fallback` for tiny calib slices.
+
+Both calibrators are STILL re-fit on the full calib slice and metrics
+for both (plus identity) are persisted, so the selection is fully
+auditable. `metadata.json` adds an `identity` entry to both `metrics`
+and `inner_val_metrics`.
+
+**Rationale:**
+- The skip guard is the right answer when raw is already calibrated:
+  the optimal calibration map IS the identity, and learning a Platt
+  or isotonic map can only add variance. The 0.001 default threshold
+  matches `auto_min_delta_ece` — both express "the differences below
+  this aren't statistically meaningful at our sample sizes."
+- Time-ordered inner-val is the right answer when there's drift
+  between calib and test windows. Random shuffle inside the calib
+  slice gives an inner-val that looks like the calib slice; the tail
+  gives an inner-val that looks like the test slice. The latter is
+  what we actually need to predict generalisation.
+- Combining both is statistically sound: if a calibrator's apparent
+  win on the random-shuffle inner-val disappears on the time-ordered
+  inner-val (because that's where drift is visible), the skip guard
+  catches the case and falls back to identity. Either fix alone is
+  insufficient; together they are.
+- Identity mode persists Platt and isotonic anyway so the same
+  artifact directory can be re-loaded, inspected, and the choice
+  re-litigated against newer data without re-training.
+
+**Empirical Validation:**
+First full-parquet re-run (ECE-only skip) showed isotonic still chosen
+because iso beat raw on inner-val ECE by 4-5× threshold — but iso's
+inner-val Brier improvement was vanishingly small. Test slice
+confirmed: post-cal ECE 0.0058 / 0.0048 vs pre-cal 0.0031 / 0.0034
+(speed_form / meta), and Brier essentially unchanged. The "win" was
+mostly bin redistribution.
+
+Post-Brier-co-criterion full-parquet re-run (the shipped behavior):
+- `speed_form`: `chosen_method='identity'` — isotonic's Brier
+  improvement on inner-val was 2.8e-6 (≪ 1e-4 threshold), so skip
+  fires. Test pre-cal = post-cal exactly: ECE 0.0031, Brier 0.0732,
+  log-loss 0.2623. No degradation.
+- `meta_learner`: `chosen_method='isotonic'` — isotonic's inner-val
+  Brier beats identity by 1.6e-4 (just above the 1e-4 threshold).
+  This is a genuine (if small) accuracy improvement, and it transfers
+  to the test slice: post-cal Brier 0.06788 vs pre-cal 0.06789
+  (better by 1.6e-5), post-cal log-loss 0.23693 vs pre-cal 0.23704
+  (better by 1.1e-4). Both strictly proper scores improve. Test ECE
+  moved the "wrong" way (0.0034 → 0.0048) — but ECE is the binned
+  summary that the Brier co-criterion was put in place to override.
+  This is the guard working as designed: ECE alone said "apply
+  isotonic, big win"; the proper scores said "tiny but real win";
+  the guard correctly applied the tiny-but-real win and ignored
+  the bin-summary signal.
+
+The guard is therefore a PRECISION FILTER, not a blanket disable: it
+correctly applies calibration when proper scores agree there is a
+real win (meta_learner) and correctly skips when they don't
+(speed_form). On future datasets where isotonic genuinely improves
+both inner-val ECE AND inner-val Brier over raw by the configured
+thresholds, calibration SHOULD be applied.
+
+**Relationship to ADR-037:**
+ADR-037 stays in force — held-out inner-val is still the criterion
+for choosing BETWEEN Platt and isotonic. ADR-038 extends the choice
+set to include identity, and lets the caller control which rows
+constitute the inner-val.
+
+**Rejected Alternatives:**
+- Always force `method='identity'` for downstream models known to be
+  well-calibrated (e.g. meta-learner) — rejected. The whole point of
+  the auto-selector is that calibration need can change with data,
+  model retraining, and jurisdiction. A static rule misses the case
+  where the model becomes miscalibrated mid-season and needs a
+  Platt/isotonic correction.
+- Use the test slice itself as the inner-val (target leakage) —
+  obviously rejected.
+- Walk-forward calibration (re-fit calibrator on a rolling window of
+  the most recent N races) — deferred to Phase 5 / production. This
+  is the right answer for production but requires online infra.
+  ADR-038's tail-of-calib inner-val is the offline approximation.
+
+
+---
+
+## ADR-039: Phase 5a Bet-Type Scope — Win + Exacta + Trifecta + Superfecta Only
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+**Context:**
+Phase 5a's `BetCandidate` schema and EV calculator support a subset of pari-mutuel bet types. The PL ordering module produces marginals for any combinatorial bet; the question is which ones the calculator should *emit* given current data and model coverage.
+
+**Decision:**
+Phase 5a supports `WIN`, `EXACTA`, `TRIFECTA`, `SUPERFECTA` only. The schema validator (`BetCandidate.validate_selection`) rejects `PLACE`, `SHOW`, `PICK3`, `PICK4`, `PICK6` with `ValueError`.
+
+**Rationale:**
+- **Place/Show payouts** are not deterministic functions of (selection, win_probs, decimal_odds). The payout depends on which OTHER horses finish in the money AND on the live pool composition (how much is bet on each potential placing horse). Without live pari-mutuel pool composition data, we can only compute the *probability* of placing/showing, not the EV. Closed-form helpers `place_prob` and `show_prob` are added to `plackett_luce.py` for future use, but Phase 5a does not emit Place/Show candidates.
+- **Pick 3/4/6** are cross-race bets. Correct probability requires modelling the shared latent track state per card (Master Reference §206-209). The current ordering module treats races as independent. Adding cross-race correlation is a separate phase.
+
+**Rejected Alternatives:**
+- Emit Place/Show with a uniform-pool-composition approximation — rejected; the approximation is systematically wrong for the favourite-vs-longshot place pool, exactly where the largest +EV opportunities exist.
+- Emit Pick N with multiplied marginals — rejected; same independence assumption that Harville carries, which CLAUDE.md §2 prohibits.
+
+**When to revisit:**
+When live tote ingestion is built AND when a card-level latent-state model is trained.
+
+---
+
+## ADR-040: EV Engine Odds Are Source-Agnostic; Validation Script Picks Mode
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+**Context:**
+The EV engine consumes `(win_probs, decimal_odds)`. The system has multiple potential odds sources:
+- Morning-line from parsed PDFs (available now, biased low-information prior).
+- Historical `odds_final` from PP lines (the actual closing market price for past races — most accurate possible for backtests).
+- Live tote-board odds at post-time (most accurate for live, but not yet ingested).
+
+**Decision:**
+The EV calculator (`compute_ev_candidates`) accepts `decimal_odds: np.ndarray` as an input. It does not know or care how the array was produced. The validation script (`scripts/validate_phase5a_ev_engine.py`) supports two modes:
+- `--mode backtest` (default): uses `odds_final` from the parquet (real closing market prices). The validation script restricts this mode to WIN bets because exotic per-permutation historical odds are not in the parquet.
+- `--mode live` (stub in 5a): would use morning-line from a parsed RaceCard. Raises `NotImplementedError` until the PDF-ingestion-to-EV integration is built.
+
+A future `live tote` mode is a third value added without changing the calculator signature.
+
+**Rationale:**
+Decoupling the calculator from the odds source has three consequences:
+1. **Backtests use the most accurate available data** — closing market prices are exactly what the bet would have settled at.
+2. **The live path is a one-config-flag swap** when live tote becomes available; no calculator changes needed.
+3. **Tests are simpler** — synthetic odds vectors are passed directly without mocking any odds-source dependency.
+
+**Rejected Alternatives:**
+- Embed odds source selection inside the calculator with a `source` argument — rejected; it pushes ingestion concerns into a math module that should be agnostic.
+- Use de-vigged morning-line as the canonical odds for both backtest and live — rejected; ML is a strictly worse estimator than `odds_final` for backtests and would hide model performance behind a noisy input.
+
+**Note on smoke-run data quality (carried forward to Phase 5b):**
+The first backtest smoke run (5% sample → 11,574 test rows / 8,717 races) produced 10,663 +EV candidates with mean edge 0.705 and mean EV/$ of 34.9 — both implausibly large. Root cause: the parquet's `odds_final` column contains extreme values (likely 99/999 placeholders for scratched or rare-payout horses) which, when fed into `1/odds`, produce near-zero market probabilities and therefore enormous nominal edges against ANY non-zero model probability. The EV engine is computing what it was asked; the data is the problem. Phase 5b should add an upper bound on `decimal_odds` at the validation-script level (suggested cap: ~100, dropping ~scratched/placeholder rows) before the portfolio optimiser will produce sensible results.

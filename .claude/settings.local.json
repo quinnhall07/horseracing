@@ -20,7 +20,13 @@
       "Bash(tasklist /FI \"IMAGENAME eq python.exe\")",
       "PowerShell(Get-Process *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(where python *)",
+      "Bash(where py *)",
+      "Bash(py -3.11 -m pytest tests/test_calibration/test_calibrator.py -x --tb=short)",
+      "Bash(py --list)",
+      "Bash(C:/Users/danie/AppData/Local/Python/bin/python.exe --version)",
+      "Bash(tasklist)"
     ]
   }
 }
