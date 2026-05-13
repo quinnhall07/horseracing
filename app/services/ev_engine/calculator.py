@@ -44,12 +44,7 @@ from app.services.ev_engine.market_impact import (
     DEFAULT_TAKEOUT,
     post_bet_decimal_odds,
 )
-from app.services.portfolio.sizing import (
-    DEFAULT_KELLY_FRACTION,
-    DEFAULT_MAX_BET_FRACTION,
-    apply_bet_cap,
-    kelly_fraction,
-)
+from app.services.portfolio.sizing import apply_bet_cap, kelly_fraction
 
 log = get_logger(__name__)
 
@@ -100,8 +95,12 @@ def _candidate_for_win(
     # Apply market impact if pool_size is available. We need the proposed
     # stake to compute the post-bet odds, but the stake itself depends on
     # the post-bet odds via Kelly. We use the PRE-impact Kelly as a first
-    # estimate, then recompute odds at that stake — a single-step
-    # approximation that is accurate to ~1% for sub-pool-fraction bets.
+    # estimate, then recompute odds at that stake. Because post_odds ≤
+    # pre_odds always, post_kelly ≤ pre_kelly, so using pre_kelly as the
+    # impact-estimate stake OVERESTIMATES impact — i.e., the reported EV
+    # is a conservative lower bound on the true settled EV. When stake
+    # vastly exceeds pool, the post-impact edge recheck correctly returns
+    # None rather than producing a silently-wrong candidate.
     pre_market_prob = 1.0 / pre_odds
     pre_edge = model_prob - pre_market_prob
     if pre_edge < min_edge:
