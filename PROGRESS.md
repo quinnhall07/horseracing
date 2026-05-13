@@ -7,9 +7,9 @@ Format: newest session at the top.
 
 ## Current State
 
-**Phase:** Phase 5a — EV Engine **COMPLETE** · Phase 5b — Portfolio Optimiser **COMPLETE** · Phase 6 — Frontend **NEXT**.
-**Last completed task:** Phase 5b portfolio optimiser landed end-to-end on branch `worktree-agent-a876df5324605a63d`. New module: `app/services/portfolio/optimizer.py` (Rockafellar-Uryasev CVaR LP via `scipy.optimize.linprog(method="highs")` with vectorised Plackett-Luce Gumbel scenarios). PL gained `sample_orderings_vectorised` (Gumbel-Max trick, single-numpy-call PL sampling). Validation script gained `--max-decimal-odds` cap (default 100, drops 99/999 placeholders per ADR-040's flagged data-quality issue) and `--optimize` flag wiring (`evaluate(...)` now returns `(candidates, summary, portfolios)`; behaviour unchanged when not passed). ADR-041 documents the CVaR LP packing + per-race scope + 1000-scenario default. **557 tests passing** (was 541 in the non-API suite → +16: 10 optimizer + 6 PL sampler).
-**Next task:** Phase 6 — Frontend scaffold. Next.js 14 + Tailwind + Recharts; consumes the FastAPI surface to render race-card upload, probability bars, and the bet-execution ticket from Phase 5b's `Portfolio.recommendations`.
+**Phase:** Phase 5a — EV Engine **COMPLETE** · Phase 5b — Portfolio Optimiser **COMPLETE** · Phase 6 — Frontend **COMPLETE**. All seven documented phases (0-6) are now landed; Master-Reference Layer 7 (feedback/online learning loop) is the next unplanned-but-documented track.
+**Last completed task:** Phase 5b + Phase 6 landed end-to-end on parallel worktree branches and merged into `main`. Phase 5b new module: `app/services/portfolio/optimizer.py` (Rockafellar-Uryasev CVaR LP via `scipy.optimize.linprog(method="highs")` with vectorised Plackett-Luce Gumbel scenarios). PL gained `sample_orderings_vectorised` (Gumbel-Max trick, single-numpy-call PL sampling). Validation script gained `--max-decimal-odds` cap (default 100, drops 99/999 placeholders per ADR-040's flagged data-quality issue) and `--optimize` flag wiring (`evaluate(...)` now returns `(candidates, summary, portfolios)`; behaviour unchanged when not passed). Phase 6 stood up `frontend/` from empty: Next.js 14 App Router, TypeScript strict, Tailwind, Recharts, full schema-to-TS type mirror, three pages (upload / card viewer / portfolio ticket), eight components, mock-mode for backend-less demo. ADR-041 documents the CVaR LP packing + per-race scope + 1000-scenario default. **557 tests passing** (was 541 in the non-API suite → +16: 10 optimizer + 6 PL sampler). Frontend `npm run build` ✅ (4 routes, zero TS/ESLint errors).
+**Next task:** Phase 7 — feedback / online-learning loop (Master Reference §179-187): outcome logging → calibration drift CUSUM (already partially built in `app/services/calibration/drift.py`) → rolling sub-model retraining → portfolio-level drift detection. Or: backend `/api/v1/cards/{id}` + `/api/v1/portfolio/{id}` endpoints so the frontend can leave MOCK mode.
 
 ### Phase 5a smoke result — flagged for Phase 5b investigation
 
@@ -151,6 +151,46 @@ Phase 5b built end-to-end on branch `worktree-agent-a876df5324605a63d` in a sing
 2. **`max_bet_fraction` is the CLAUDE.md §2 / ADR-002 3% cap.** No way to relax it per-race for high-confidence stakes; that would require an ADR amendment.
 3. **The synthetic smoke harness `scripts/smoke_phase5b_optimizer.py` is for CI / clean-clone parity, not for real validation.** The real smoke requires the training parquet. The parquet's regeneration is a Phase 0 concern.
 4. **No portfolio-level drift detection.** Phase 4's `app/services/calibration/drift.py` covers calibration drift; Phase 5b doesn't add a portfolio-level analogue (e.g., realised vs. expected loss CUSUM). Likely a Phase 7 deliverable.
+
+---
+
+### Session: 2026-05-13 (d) — Phase 6 frontend scaffold (parallel-agent, worktree)
+
+**Branch:** `worktree-agent-aa1eee584ff871c89` (merged into `main` alongside Phase 5b).
+
+**Completed:**
+
+Stood up `frontend/` from empty per CLAUDE.md §3 and §4. Hand-rolled Next.js 14.2 App Router project (TypeScript strict, Tailwind, JetBrains Mono + Inter via `next/font/google`, Lucide icons, Recharts for the EV gauge — no other UI libs).
+
+*Pages*
+- `app/page.tsx` — drag-and-drop PDF upload, Demo / mock toggle, success summary with "Analyze card →" CTA.
+- `app/card/[id]/page.tsx` — sticky header + breadcrumb, `RaceTabs` across the top, selected race shows `RaceHeader` + `HorseTable` (sorted by model_prob desc) + `EVGauge` side-by-side.
+- `app/card/[id]/portfolio/page.tsx` — risk strip (bankroll, expected_return, total_stake_fraction, var_95, cvar_95, bet count) + `BetTicket` + no-op Confirm CTA.
+
+*Components* (all under `frontend/components/<Group>/`): `RaceHeader`, `RaceTabs`, `HorseRow`, `HorseTable`, `EVGauge` (Recharts BarChart), `ProbabilityBar` (pure SVG stacked bar), `BetTicketRow`, `BetTicket`. Expandable horse detail rows show top-3 PP lines + computed features (local state, no router push).
+
+*Lib*
+- `lib/types.ts` — full TS mirror of `app/schemas/race.py` and `app/schemas/bets.py`. Pydantic Optional → `T | null`. Tuples (`BetCandidate.selection`) → `number[]`. UI-only optional fields on `HorseEntry` (`program_number`, `model_prob`, `market_prob`, `edge`) for the calibrated-prob payload the `/analyze` endpoint will eventually provide.
+- `lib/api.ts` — `uploadCard` / `getCard` / `getPortfolio` typed wrappers. Reads `NEXT_PUBLIC_API_BASE` (default `http://localhost:8000`) and `NEXT_PUBLIC_MOCK_API`. When MOCK is `true`, returns deterministic seeded mock data with a 600-900 ms simulated network delay.
+- `lib/mock.ts` — 9-race Churchill Downs card (mirrors the CD-05/10/2026 fixture). Seeded `mulberry32` PRNG → 7-12 horses per race, model_probs that sum to ~1.0, mix of +/- edges, 6 BetRecommendations across the card with every `stake_fraction` ≤ 0.03 (ADR-002) and `cvar_95 = -8.5%` of bankroll (well under the 20% rail).
+- `lib/format.ts` — `formatOdds`, `formatProb`, `formatMoney`, `formatDistance` (sprint → `6f`, route → `1 1/16m`), `formatTime`, `formatEdge`, `formatFraction`, `formatSelection`, `formatBetType`, `formatDate`. All null-safe.
+
+*Backend endpoints still missing for production* (see frontend/README.md):
+- `GET /api/v1/cards/{card_id}` → `RaceCard` (calibrated probabilities hydrated). Currently mocked.
+- `GET /api/v1/portfolio/{card_id}` → `Portfolio`. Currently mocked. Will be served by Phase 5b once merged.
+- The existing `POST /api/v1/ingest/upload` does not echo the persisted `card_id` on `IngestionResult`. Frontend handles it gracefully (falls back to `"latest"`); when the backend is updated, no frontend change required — the IngestionResult type already declares the optional `card_id` field.
+
+**Verification:**
+- `npm install` clean (424 packages, expected upstream deprecation warnings).
+- `npm run build` ✅ — 4 routes (`/`, `/_not-found`, `/card/[id]`, `/card/[id]/portfolio`) built with zero TypeScript or ESLint errors. First Load JS 87.5 kB shared. Tailwind compiled clean.
+- `node_modules/` and `.next/` confirmed in `.gitignore` and absent from the working tree.
+
+**Deferred / polish:**
+- Real upload progress events (the FastAPI endpoint isn't streaming, so this would be a fake animation). Skipped.
+- Tests: explicitly out of scope per Phase 6 spec ("no tests").
+- `/analyze` endpoint integration: hydrate `model_prob`/`market_prob`/`edge` on `HorseEntry` from the calibration layer. The fields are already typed; the moment the backend ships the endpoint the existing components light up.
+
+**Next:** Phase 7 — feedback / online learning loop (Master Reference §179-187). Or: ship the backend `/api/v1/cards/{id}` + `/api/v1/portfolio/{id}` endpoints so the frontend can leave MOCK mode.
 
 ---
 
