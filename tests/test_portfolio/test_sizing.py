@@ -1,8 +1,6 @@
 """Unit tests for app/services/portfolio/sizing.py."""
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from app.services.portfolio.sizing import (
@@ -40,7 +38,17 @@ def test_kelly_positive_edge_matches_handbook_formula():
         full = (0.25*4 - 0.75)/4 = (1.0 - 0.75)/4 = 0.0625
         quarter = 0.015625
     """
+    assert kelly_fraction(edge=0.05, decimal_odds=4.0) == pytest.approx(0.0)
+    assert kelly_fraction(edge=0.20, decimal_odds=4.0) == pytest.approx(0.0)
     assert kelly_fraction(edge=0.25, decimal_odds=4.0) == pytest.approx(0.015625)
+
+
+def test_kelly_decimal_odds_at_unity_boundary():
+    """decimal_odds=1.0 means the bet returns only the stake on a win (net
+    payout = 0). At edge = 0.5, full Kelly hits 0 exactly: numerator
+    `0.5*1 - (1-0.5) = 0`. The function accepts this boundary as valid input
+    and returns 0."""
+    assert kelly_fraction(edge=0.5, decimal_odds=1.0) == pytest.approx(0.0)
 
 
 def test_kelly_returns_truncated_when_full_kelly_negative():
