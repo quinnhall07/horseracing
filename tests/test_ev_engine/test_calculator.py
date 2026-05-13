@@ -164,13 +164,15 @@ def test_compute_exacta_candidates_from_exotic_odds_dict():
     from app.services.ev_engine.calculator import compute_ev_candidates
 
     win_probs = np.array([0.50, 0.30, 0.20])
-    # Public exacta odds (gross decimal); we make horse-0-1 very generous.
+    # Public exacta odds (gross decimal); we make some +EV and one -EV to
+    # exercise the filter from both directions.
     exotic_odds = {
         BetType.EXACTA: {
             (0, 1): 8.0,   # PL prob: 0.50 * 0.30 / 0.50 = 0.30; market 0.125; edge 0.175 → PASS
             (0, 2): 12.0,  # PL prob: 0.50 * 0.20 / 0.50 = 0.20; market 0.083; edge 0.117 → PASS
             (1, 0): 8.0,   # PL prob: 0.30 * 0.50 / 0.70 ≈ 0.214; market 0.125; edge 0.089 → PASS
             (1, 2): 30.0,  # PL prob: 0.30 * 0.20 / 0.70 ≈ 0.0857; market 0.033; edge 0.052 → PASS
+            (2, 1): 3.0,   # PL prob: 0.20 * 0.30 / 0.80 = 0.075; market 0.333; edge -0.258 → FAIL
         }
     }
     candidates = compute_ev_candidates(
@@ -182,8 +184,9 @@ def test_compute_exacta_candidates_from_exotic_odds_dict():
         exotic_odds=exotic_odds,
     )
     selections = {c.selection for c in candidates}
-    # All four permutations have edge >= 0.05 per the math above.
+    # Only the four positive-edge permutations pass; (2, 1) is filtered out.
     assert selections == {(0, 1), (0, 2), (1, 0), (1, 2)}
+    assert (2, 1) not in selections
 
 
 def test_compute_trifecta_candidates():
@@ -282,7 +285,15 @@ def test_exotic_market_impact_reduces_ev():
 
 
 def test_exotic_selection_validates_distinct_indices():
-    """The schema enforces distinctness; bad caller data should raise."""
+    """Repeated indices in an exotic selection must raise.
+
+    The error is raised by `plackett_luce._validate_indices` when the PL
+    probability is computed — before the BetCandidate is constructed. The
+    BetCandidate schema's own distinctness validator is a second line of
+    defence at the schema layer. Either layer firing is acceptable; what
+    matters for the calculator's contract is that bad caller data does not
+    silently produce a malformed candidate.
+    """
     from app.services.ev_engine.calculator import compute_ev_candidates
 
     with pytest.raises(ValueError):

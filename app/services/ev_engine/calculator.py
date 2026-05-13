@@ -33,7 +33,7 @@ Public API:
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 import numpy as np
 
@@ -86,9 +86,10 @@ def _validate_inputs(win_probs: np.ndarray, decimal_odds: np.ndarray) -> None:
         raise ValueError("decimal_odds must all be >= 1")
 
 
-def _candidate_for_win(
+def _build_candidate(
     race_id: str,
-    horse_idx: int,
+    bet_type: BetType,
+    selection: tuple[int, ...],
     model_prob: float,
     pre_odds: float,
     bankroll: float,
@@ -96,82 +97,21 @@ def _candidate_for_win(
     takeout_rate: float,
     min_edge: float,
 ) -> Optional[BetCandidate]:
-    """Build a single WIN BetCandidate. Returns None if edge < min_edge."""
-    # Apply market impact if pool_size is available. We need the proposed
-    # stake to compute the post-bet odds, but the stake itself depends on
-    # the post-bet odds via Kelly. We use the PRE-impact Kelly as a first
-    # estimate, then recompute odds at that stake. Because post_odds ≤
-    # pre_odds always, post_kelly ≤ pre_kelly, so using pre_kelly as the
-    # impact-estimate stake OVERESTIMATES impact — i.e., the reported EV
-    # is a conservative lower bound on the true settled EV. When stake
-    # vastly exceeds pool, the post-impact edge recheck correctly returns
-    # None rather than producing a silently-wrong candidate.
-    pre_market_prob = 1.0 / pre_odds
-    pre_edge = model_prob - pre_market_prob
-    if pre_edge < min_edge:
-        return None
+    """Shared candidate-construction body for Win and exotic bets.
 
-    if pool_size is not None:
-        pre_kelly = kelly_fraction(pre_edge, pre_odds)
-        pre_stake_frac_capped = apply_bet_cap(pre_kelly)
-        pre_stake = pre_stake_frac_capped * bankroll
-        decimal_odds = post_bet_decimal_odds(
-            pre_odds=pre_odds,
-            bet_amount=pre_stake,
-            pool_size=pool_size,
-            takeout_rate=takeout_rate,
-        )
-        market_impact_applied = True
-    else:
-        decimal_odds = pre_odds
-        market_impact_applied = False
+    Caller computes `model_prob` for the specific bet type (raw win prob for
+    Win; PL-derived for exotics) and `selection`. This helper handles the
+    pre-edge filter, optional market impact, post-edge filter, Kelly sizing,
+    and `BetCandidate` construction.
 
-    market_prob = 1.0 / decimal_odds
-    edge = model_prob - market_prob
-    if edge < min_edge:
-        return None
-
-    ev = expected_value_per_dollar(model_prob, decimal_odds)
-    kelly = kelly_fraction(edge, decimal_odds)
-    kelly_capped = apply_bet_cap(kelly)
-
-    return BetCandidate(
-        race_id=race_id,
-        bet_type=BetType.WIN,
-        selection=(horse_idx,),
-        model_prob=float(model_prob),
-        decimal_odds=float(decimal_odds),
-        market_prob=float(market_prob),
-        edge=float(edge),
-        expected_value=float(ev),
-        kelly_fraction=float(kelly_capped),
-        market_impact_applied=market_impact_applied,
-        pool_size=pool_size,
-    )
-
-
-_PL_PROB_FN = {
-    BetType.EXACTA: lambda p, sel: exacta_prob(p, sel[0], sel[1]),
-    BetType.TRIFECTA: lambda p, sel: trifecta_prob(p, sel[0], sel[1], sel[2]),
-    BetType.SUPERFECTA: lambda p, sel: superfecta_prob(p, sel[0], sel[1], sel[2], sel[3]),
-}
-
-
-def _candidate_for_exotic(
-    race_id: str,
-    bet_type: BetType,
-    selection: tuple[int, ...],
-    win_probs: np.ndarray,
-    pre_odds: float,
-    bankroll: float,
-    pool_size: Optional[float],
-    takeout_rate: float,
-    min_edge: float,
-) -> Optional[BetCandidate]:
-    """Build a single exotic BetCandidate. Returns None if edge < min_edge."""
-    pl_fn = _PL_PROB_FN[bet_type]
-    model_prob = float(pl_fn(win_probs, selection))
-
+    Market impact: when pool_size is given we use the PRE-impact Kelly stake
+    as the impact estimate, then recompute odds at that stake. Because
+    post_odds ≤ pre_odds always, post_kelly ≤ pre_kelly — so the pre_kelly
+    estimate OVERESTIMATES impact, making reported EV a conservative lower
+    bound on the true settled EV. When the proposed stake vastly exceeds the
+    pool, the post-impact edge recheck returns None rather than producing
+    a silently-wrong candidate.
+    """
     pre_market_prob = 1.0 / pre_odds
     pre_edge = model_prob - pre_market_prob
     if pre_edge < min_edge:
@@ -205,7 +145,7 @@ def _candidate_for_exotic(
         race_id=race_id,
         bet_type=bet_type,
         selection=selection,
-        model_prob=model_prob,
+        model_prob=float(model_prob),
         decimal_odds=float(decimal_odds),
         market_prob=float(market_prob),
         edge=float(edge),
@@ -213,6 +153,64 @@ def _candidate_for_exotic(
         kelly_fraction=float(kelly_capped),
         market_impact_applied=market_impact_applied,
         pool_size=pool_size,
+    )
+
+
+def _candidate_for_win(
+    race_id: str,
+    horse_idx: int,
+    model_prob: float,
+    pre_odds: float,
+    bankroll: float,
+    pool_size: Optional[float],
+    takeout_rate: float,
+    min_edge: float,
+) -> Optional[BetCandidate]:
+    """Build a single WIN BetCandidate. Returns None if edge < min_edge."""
+    return _build_candidate(
+        race_id=race_id,
+        bet_type=BetType.WIN,
+        selection=(horse_idx,),
+        model_prob=model_prob,
+        pre_odds=pre_odds,
+        bankroll=bankroll,
+        pool_size=pool_size,
+        takeout_rate=takeout_rate,
+        min_edge=min_edge,
+    )
+
+
+_PL_PROB_FN: dict[BetType, Callable[[np.ndarray, tuple[int, ...]], float]] = {
+    BetType.EXACTA: lambda p, sel: exacta_prob(p, sel[0], sel[1]),
+    BetType.TRIFECTA: lambda p, sel: trifecta_prob(p, sel[0], sel[1], sel[2]),
+    BetType.SUPERFECTA: lambda p, sel: superfecta_prob(p, sel[0], sel[1], sel[2], sel[3]),
+}
+
+
+def _candidate_for_exotic(
+    race_id: str,
+    bet_type: BetType,
+    selection: tuple[int, ...],
+    win_probs: np.ndarray,
+    pre_odds: float,
+    bankroll: float,
+    pool_size: Optional[float],
+    takeout_rate: float,
+    min_edge: float,
+) -> Optional[BetCandidate]:
+    """Build a single exotic BetCandidate. Returns None if edge < min_edge."""
+    pl_fn = _PL_PROB_FN[bet_type]
+    model_prob = float(pl_fn(win_probs, selection))
+    return _build_candidate(
+        race_id=race_id,
+        bet_type=bet_type,
+        selection=selection,
+        model_prob=model_prob,
+        pre_odds=pre_odds,
+        bankroll=bankroll,
+        pool_size=pool_size,
+        takeout_rate=takeout_rate,
+        min_edge=min_edge,
     )
 
 
