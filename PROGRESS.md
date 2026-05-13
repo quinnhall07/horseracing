@@ -102,6 +102,46 @@ JP carries 1.6M rows with no speed figure. Either derive a synthetic speed figur
 
 ## Session Log
 
+### Session: 2026-05-13 (c) — Phase 6 frontend scaffold (parallel-agent, worktree)
+
+**Branch:** `worktree-agent-aa1eee584ff871c89` (do not push; will be folded into main alongside Phase 5b).
+
+**Completed:**
+
+Stood up `frontend/` from empty per CLAUDE.md §3 and §4. Hand-rolled Next.js 14.2 App Router project (TypeScript strict, Tailwind, JetBrains Mono + Inter via `next/font/google`, Lucide icons, Recharts for the EV gauge — no other UI libs).
+
+*Pages*
+- `app/page.tsx` — drag-and-drop PDF upload, Demo / mock toggle, success summary with "Analyze card →" CTA.
+- `app/card/[id]/page.tsx` — sticky header + breadcrumb, `RaceTabs` across the top, selected race shows `RaceHeader` + `HorseTable` (sorted by model_prob desc) + `EVGauge` side-by-side.
+- `app/card/[id]/portfolio/page.tsx` — risk strip (bankroll, expected_return, total_stake_fraction, var_95, cvar_95, bet count) + `BetTicket` + no-op Confirm CTA.
+
+*Components* (all under `frontend/components/<Group>/`): `RaceHeader`, `RaceTabs`, `HorseRow`, `HorseTable`, `EVGauge` (Recharts BarChart), `ProbabilityBar` (pure SVG stacked bar), `BetTicketRow`, `BetTicket`. Expandable horse detail rows show top-3 PP lines + computed features (local state, no router push).
+
+*Lib*
+- `lib/types.ts` — full TS mirror of `app/schemas/race.py` and `app/schemas/bets.py`. Pydantic Optional → `T | null`. Tuples (`BetCandidate.selection`) → `number[]`. UI-only optional fields on `HorseEntry` (`program_number`, `model_prob`, `market_prob`, `edge`) for the calibrated-prob payload the `/analyze` endpoint will eventually provide.
+- `lib/api.ts` — `uploadCard` / `getCard` / `getPortfolio` typed wrappers. Reads `NEXT_PUBLIC_API_BASE` (default `http://localhost:8000`) and `NEXT_PUBLIC_MOCK_API`. When MOCK is `true`, returns deterministic seeded mock data with a 600-900 ms simulated network delay.
+- `lib/mock.ts` — 9-race Churchill Downs card (mirrors the CD-05/10/2026 fixture). Seeded `mulberry32` PRNG → 7-12 horses per race, model_probs that sum to ~1.0, mix of +/- edges, 6 BetRecommendations across the card with every `stake_fraction` ≤ 0.03 (ADR-002) and `cvar_95 = -8.5%` of bankroll (well under the 20% rail).
+- `lib/format.ts` — `formatOdds`, `formatProb`, `formatMoney`, `formatDistance` (sprint → `6f`, route → `1 1/16m`), `formatTime`, `formatEdge`, `formatFraction`, `formatSelection`, `formatBetType`, `formatDate`. All null-safe.
+
+*Backend endpoints still missing for production* (see frontend/README.md):
+- `GET /api/v1/cards/{card_id}` → `RaceCard` (calibrated probabilities hydrated). Currently mocked.
+- `GET /api/v1/portfolio/{card_id}` → `Portfolio`. Currently mocked. Will be served by Phase 5b once merged.
+- The existing `POST /api/v1/ingest/upload` does not echo the persisted `card_id` on `IngestionResult`. Frontend handles it gracefully (falls back to `"latest"`); when the backend is updated, no frontend change required — the IngestionResult type already declares the optional `card_id` field.
+
+**Verification:**
+- `npm install` clean (424 packages, expected upstream deprecation warnings).
+- `npm run build` ✅ — 4 routes (`/`, `/_not-found`, `/card/[id]`, `/card/[id]/portfolio`) built with zero TypeScript or ESLint errors. First Load JS 87.5 kB shared. Tailwind compiled clean.
+- `node_modules/` and `.next/` confirmed in `.gitignore` and absent from the working tree.
+
+**Deferred / polish:**
+- Real upload progress events (the FastAPI endpoint isn't streaming, so this would be a fake animation). Skipped.
+- Tests: explicitly out of scope per Phase 6 spec ("no tests").
+- `/analyze` endpoint integration: hydrate `model_prob`/`market_prob`/`edge` on `HorseEntry` from the calibration layer. The fields are already typed; the moment the backend ships the endpoint the existing components light up.
+
+**Next:** integrate Phase 5b + Phase 6 worktree branches back to `main`.
+
+---
+
 ### Session: 2026-05-13 (b) — Phase 5a EV engine (subagent-driven)
 
 **Completed:**
