@@ -52,13 +52,26 @@ DEFAULT_TAKEOUT: dict[str, float] = {
 Track-specific overrides should be passed explicitly when known."""
 
 
-def _validate(pre_odds: float, bet_amount: float, takeout_rate: float) -> None:
+def _validate(
+    pre_odds: float,
+    bet_amount: float,
+    takeout_rate: float,
+    pool_size: Optional[float] = None,
+) -> None:
+    """Single source of truth for all market-impact input validation.
+
+    `bet_amount=0` and `pool_size=None` are both valid; the caller decides
+    what to do with those (e.g., the zero-impact early return). `pool_size`
+    is checked only when provided.
+    """
     if pre_odds < 1.0:
         raise ValueError(f"pre_odds must be >= 1; got {pre_odds}")
     if bet_amount < 0.0:
         raise ValueError(f"bet_amount must be >= 0; got {bet_amount}")
     if not 0.0 <= takeout_rate < 1.0:
         raise ValueError(f"takeout_rate must be in [0, 1); got {takeout_rate}")
+    if pool_size is not None and pool_size <= 0.0:
+        raise ValueError(f"pool_size must be > 0; got {pool_size}")
 
 
 def inferred_winning_bets(
@@ -68,12 +81,7 @@ def inferred_winning_bets(
 
     pre_odds = (1 − τ) × pool_size / B   →   B = (1 − τ) × pool_size / pre_odds
     """
-    if pool_size <= 0:
-        raise ValueError(f"pool_size must be > 0; got {pool_size}")
-    if pre_odds < 1.0:
-        raise ValueError(f"pre_odds must be >= 1; got {pre_odds}")
-    if not 0.0 <= takeout_rate < 1.0:
-        raise ValueError(f"takeout_rate must be in [0, 1); got {takeout_rate}")
+    _validate(pre_odds, 0.0, takeout_rate, pool_size=pool_size)
     return (1.0 - takeout_rate) * pool_size / pre_odds
 
 
@@ -97,11 +105,9 @@ def post_bet_decimal_odds(
         pre_odds and pool_size. Returns pre_odds when pool_size is None
         or bet_amount is 0.
     """
-    _validate(pre_odds, bet_amount, takeout_rate)
+    _validate(pre_odds, bet_amount, takeout_rate, pool_size=pool_size)
     if pool_size is None or bet_amount == 0.0:
         return float(pre_odds)
-    if pool_size <= 0:
-        raise ValueError(f"pool_size must be > 0; got {pool_size}")
 
     B = inferred_winning_bets(pre_odds, pool_size, takeout_rate)
     new_pool = pool_size + bet_amount

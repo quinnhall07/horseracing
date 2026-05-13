@@ -101,3 +101,28 @@ def test_rejects_takeout_outside_unit():
         post_bet_decimal_odds(
             pre_odds=5.0, bet_amount=100.0, pool_size=10_000.0, takeout_rate=-0.01
         )
+
+
+def test_post_odds_at_winning_pool_saturation():
+    """bet_amount == B (winning-pool size): the user doubles the winning
+    side. Post odds = (1 − τ)(P + B)/(2B). This is the 50% saturation
+    structural case — sits between zero-impact and full-asymptote."""
+    pool = 10_000.0
+    tau = 0.17
+    pre_odds = 5.0
+    B = (1.0 - tau) * pool / pre_odds  # = 1660.0
+    odds = post_bet_decimal_odds(
+        pre_odds=pre_odds, bet_amount=B, pool_size=pool, takeout_rate=tau
+    )
+    expected = (1.0 - tau) * (pool + B) / (2.0 * B)
+    assert odds == pytest.approx(expected, abs=1e-9)
+
+
+def test_rejects_non_positive_pool_size():
+    """pool_size <= 0 must raise regardless of which entry point is used."""
+    with pytest.raises(ValueError, match="pool_size"):
+        post_bet_decimal_odds(
+            pre_odds=5.0, bet_amount=100.0, pool_size=0.0, takeout_rate=0.17
+        )
+    with pytest.raises(ValueError, match="pool_size"):
+        inferred_winning_bets(pre_odds=5.0, pool_size=-1.0, takeout_rate=0.17)
