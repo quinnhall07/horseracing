@@ -124,6 +124,62 @@ def superfecta_prob(p: np.ndarray, i: int, j: int, k: int, l: int) -> float:
     return prob
 
 
+def place_prob(p: np.ndarray, i: int) -> float:
+    """P(horse i finishes 1st OR 2nd) under Plackett-Luce.
+
+    Closed form: P(i top-2) = p_i + Σ_{j≠i} p_j · p_i / (1 − p_j).
+    Handles certain horses (p_j = 1) by treating the corresponding term as 0
+    if i ≠ j (i cannot place behind a horse that wins with probability 1
+    unless i is that horse) and 1 if i == j.
+    """
+    p = _validate_probs(p)
+    _validate_indices(p, (i,))
+    p_i = p[i]
+    total = p_i  # P(i wins) — i's contribution from the "wins" slot
+    for j in range(len(p)):
+        if j == i:
+            continue
+        denom = 1.0 - p[j]
+        if denom <= 1e-12:
+            # p[j] == 1 means j is certain to win; i cannot place behind j
+            # because there's no second-place draw (degenerate field). Skip.
+            continue
+        total += p[j] * p_i / denom
+    return float(total)
+
+
+def show_prob(p: np.ndarray, i: int) -> float:
+    """P(horse i finishes top-3) under Plackett-Luce.
+
+    Closed form: place_prob(p, i)
+              + Σ_{j≠i} Σ_{k∉{i,j}} p_j · p_k/(1−p_j) · p_i / (1 − p_j − p_k).
+    Numerically guards degenerate denominators (≤ 1e-12).
+    """
+    p = _validate_probs(p)
+    _validate_indices(p, (i,))
+    n = len(p)
+    if n < 3:
+        # In a field of <3 horses, P(i top-3) = 1 if i is in the field.
+        return 1.0
+
+    total = place_prob(p, i)
+    p_i = p[i]
+    for j in range(n):
+        if j == i:
+            continue
+        d1 = 1.0 - p[j]
+        if d1 <= 1e-12:
+            continue
+        for k in range(n):
+            if k == i or k == j:
+                continue
+            d2 = 1.0 - p[j] - p[k]
+            if d2 <= 1e-12:
+                continue
+            total += p[j] * (p[k] / d1) * (p_i / d2)
+    return float(total)
+
+
 def enumerate_exotic_probs(p: np.ndarray, k: int) -> dict[tuple[int, ...], float]:
     """Return all ordered length-k tuples and their PL probabilities.
 
@@ -298,7 +354,9 @@ __all__ = [
     "enumerate_exotic_probs",
     "exacta_prob",
     "fit_plackett_luce_mle",
+    "place_prob",
     "sample_ordering",
+    "show_prob",
     "superfecta_prob",
     "trifecta_prob",
 ]

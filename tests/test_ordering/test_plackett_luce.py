@@ -235,3 +235,94 @@ def test_sample_ordering_respects_strength_ordering_in_expectation():
     rates = counts / counts.sum()
     assert rates[0] > rates[1] > rates[2]
     assert abs(rates[0] - 0.7) < 0.05
+
+
+# ── Place / Show closed-form helpers ──────────────────────────────────────
+
+
+def test_place_prob_two_horse_field_equals_one():
+    """In a 2-horse field, both horses always finish top-2."""
+    from app.services.ordering.plackett_luce import place_prob
+
+    p = np.array([0.6, 0.4])
+    assert place_prob(p, 0) == pytest.approx(1.0)
+    assert place_prob(p, 1) == pytest.approx(1.0)
+
+
+def test_place_prob_uniform_three_horse_two_thirds():
+    """Uniform 3-horse field: P(any given horse top-2) = 2/3."""
+    from app.services.ordering.plackett_luce import place_prob
+
+    p = np.array([1 / 3, 1 / 3, 1 / 3])
+    for i in range(3):
+        assert place_prob(p, i) == pytest.approx(2 / 3)
+
+
+def test_place_prob_equals_enumerated_sum():
+    """Closed-form place_prob must match brute-force enumeration."""
+    from app.services.ordering.plackett_luce import (
+        enumerate_exotic_probs,
+        place_prob,
+    )
+
+    p = np.array([0.45, 0.25, 0.20, 0.10])
+    exacta = enumerate_exotic_probs(p, 2)
+    for i in range(4):
+        brute = sum(prob for perm, prob in exacta.items() if i in perm)
+        assert place_prob(p, i) == pytest.approx(brute, abs=1e-12)
+
+
+def test_place_prob_sums_to_two():
+    """In any field, Σ_i P(i top-2) = 2 exactly (two slots filled)."""
+    from app.services.ordering.plackett_luce import place_prob
+
+    p = np.array([0.40, 0.25, 0.18, 0.12, 0.05])
+    total = sum(place_prob(p, i) for i in range(5))
+    assert total == pytest.approx(2.0, abs=1e-12)
+
+
+def test_show_prob_three_horse_field_equals_one():
+    """In a 3-horse field, every horse finishes top-3."""
+    from app.services.ordering.plackett_luce import show_prob
+
+    p = np.array([0.5, 0.3, 0.2])
+    for i in range(3):
+        assert show_prob(p, i) == pytest.approx(1.0)
+
+
+def test_show_prob_equals_enumerated_sum():
+    """Closed-form show_prob must match brute-force enumeration."""
+    from app.services.ordering.plackett_luce import enumerate_exotic_probs, show_prob
+
+    p = np.array([0.40, 0.30, 0.20, 0.10])
+    tri = enumerate_exotic_probs(p, 3)
+    for i in range(4):
+        brute = sum(prob for perm, prob in tri.items() if i in perm)
+        assert show_prob(p, i) == pytest.approx(brute, abs=1e-12)
+
+
+def test_show_prob_sums_to_three():
+    """In any field, Σ_i P(i top-3) = 3 exactly (three slots filled)."""
+    from app.services.ordering.plackett_luce import show_prob
+
+    p = np.array([0.40, 0.25, 0.18, 0.12, 0.05])
+    total = sum(show_prob(p, i) for i in range(5))
+    assert total == pytest.approx(3.0, abs=1e-12)
+
+
+def test_place_show_invalid_index_raises():
+    from app.services.ordering.plackett_luce import place_prob, show_prob
+
+    p = np.array([0.6, 0.4])
+    with pytest.raises(IndexError):
+        place_prob(p, 5)
+    with pytest.raises(IndexError):
+        show_prob(p, -1)
+
+
+def test_place_prob_certain_horse():
+    """If p_i = 1, P(i top-2) = 1."""
+    from app.services.ordering.plackett_luce import place_prob
+
+    p = np.array([1.0, 0.0, 0.0])
+    assert place_prob(p, 0) == pytest.approx(1.0)
