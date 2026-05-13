@@ -1708,3 +1708,60 @@ constitute the inner-val.
   is the right answer for production but requires online infra.
   ADR-038's tail-of-calib inner-val is the offline approximation.
 
+
+---
+
+## ADR-039: Phase 5a Bet-Type Scope — Win + Exacta + Trifecta + Superfecta Only
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+**Context:**
+Phase 5a's `BetCandidate` schema and EV calculator support a subset of pari-mutuel bet types. The PL ordering module produces marginals for any combinatorial bet; the question is which ones the calculator should *emit* given current data and model coverage.
+
+**Decision:**
+Phase 5a supports `WIN`, `EXACTA`, `TRIFECTA`, `SUPERFECTA` only. The schema validator (`BetCandidate.validate_selection`) rejects `PLACE`, `SHOW`, `PICK3`, `PICK4`, `PICK6` with `ValueError`.
+
+**Rationale:**
+- **Place/Show payouts** are not deterministic functions of (selection, win_probs, decimal_odds). The payout depends on which OTHER horses finish in the money AND on the live pool composition (how much is bet on each potential placing horse). Without live pari-mutuel pool composition data, we can only compute the *probability* of placing/showing, not the EV. Closed-form helpers `place_prob` and `show_prob` are added to `plackett_luce.py` for future use, but Phase 5a does not emit Place/Show candidates.
+- **Pick 3/4/6** are cross-race bets. Correct probability requires modelling the shared latent track state per card (Master Reference §206-209). The current ordering module treats races as independent. Adding cross-race correlation is a separate phase.
+
+**Rejected Alternatives:**
+- Emit Place/Show with a uniform-pool-composition approximation — rejected; the approximation is systematically wrong for the favourite-vs-longshot place pool, exactly where the largest +EV opportunities exist.
+- Emit Pick N with multiplied marginals — rejected; same independence assumption that Harville carries, which CLAUDE.md §2 prohibits.
+
+**When to revisit:**
+When live tote ingestion is built AND when a card-level latent-state model is trained.
+
+---
+
+## ADR-040: EV Engine Odds Are Source-Agnostic; Validation Script Picks Mode
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+**Context:**
+The EV engine consumes `(win_probs, decimal_odds)`. The system has multiple potential odds sources:
+- Morning-line from parsed PDFs (available now, biased low-information prior).
+- Historical `odds_final` from PP lines (the actual closing market price for past races — most accurate possible for backtests).
+- Live tote-board odds at post-time (most accurate for live, but not yet ingested).
+
+**Decision:**
+The EV calculator (`compute_ev_candidates`) accepts `decimal_odds: np.ndarray` as an input. It does not know or care how the array was produced. The validation script (`scripts/validate_phase5a_ev_engine.py`) supports two modes:
+- `--mode backtest` (default): uses `odds_final` from the parquet (real closing market prices). The validation script restricts this mode to WIN bets because exotic per-permutation historical odds are not in the parquet.
+- `--mode live` (stub in 5a): would use morning-line from a parsed RaceCard. Raises `NotImplementedError` until the PDF-ingestion-to-EV integration is built.
+
+A future `live tote` mode is a third value added without changing the calculator signature.
+
+**Rationale:**
+Decoupling the calculator from the odds source has three consequences:
+1. **Backtests use the most accurate available data** — closing market prices are exactly what the bet would have settled at.
+2. **The live path is a one-config-flag swap** when live tote becomes available; no calculator changes needed.
+3. **Tests are simpler** — synthetic odds vectors are passed directly without mocking any odds-source dependency.
+
+**Rejected Alternatives:**
+- Embed odds source selection inside the calculator with a `source` argument — rejected; it pushes ingestion concerns into a math module that should be agnostic.
+- Use de-vigged morning-line as the canonical odds for both backtest and live — rejected; ML is a strictly worse estimator than `odds_final` for backtests and would hide model performance behind a noisy input.
+
+**Note on smoke-run data quality (carried forward to Phase 5b):**
+The first backtest smoke run (5% sample → 11,574 test rows / 8,717 races) produced 10,663 +EV candidates with mean edge 0.705 and mean EV/$ of 34.9 — both implausibly large. Root cause: the parquet's `odds_final` column contains extreme values (likely 99/999 placeholders for scratched or rare-payout horses) which, when fed into `1/odds`, produce near-zero market probabilities and therefore enormous nominal edges against ANY non-zero model probability. The EV engine is computing what it was asked; the data is the problem. Phase 5b should add an upper bound on `decimal_odds` at the validation-script level (suggested cap: ~100, dropping ~scratched/placeholder rows) before the portfolio optimiser will produce sensible results.

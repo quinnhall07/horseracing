@@ -7,9 +7,28 @@ Format: newest session at the top.
 
 ## Current State
 
-**Phase:** 0 — Master Training DB **LOADED + EXPORTED** · Phase 1 — PDF Ingestion **COMPLETE** · Phase 2 — Feature Engineering **COMPLETE** · Phase 3 — Baseline Models **COMPLETE** · Phase 4 — **COMPLETE** (Calibrator + PL + Stern + Copula + CUSUM drift + full-parquet validation; auto-selector hardened via ADR-037 + ADR-038)
-**Last completed task:** Hardened the calibrator auto-selector with three complementary fixes (ADR-037 held-out inner-val ECE; ADR-038 skip-when-calibrated guard + time-ordered inner-val support + strictly-proper Brier co-criterion). The earlier full-parquet finding (isotonic chosen on already-calibrated streams, post-cal ECE worse than raw) traced to three distinct issues: (1) fit-slice ECE criterion overfit to isotonic memorisation — fixed in ADR-037 by computing inner-val ECE with a protective bias toward Platt; (2) time distribution shift — calib slice (older years) is more miscalibrated than the immediately-following test slice — fixed by accepting `inner_val_indices` so `validate_calibration.py` can pass the time-ordered tail of calib as the inner-val; (3) ECE is bin-noisy and isotonic could "win" by redistributing probability across bins without genuine accuracy improvement (advisor caught this) — fixed by adding Brier (strictly proper) as a co-criterion in the skip check. Both ECE and Brier must beat raw for any calibration to apply; otherwise `chosen_method='identity'` and `predict_proba` returns raw clipped to [0, 1]. Identity mode persists Platt + isotonic anyway for diagnostics. **483 tests passing** (was 464 → +19: 4 ADR-037 + 11 ADR-038 + 4 Brier co-criterion).
-**Next task:** Phase 5 — EV engine (`app/services/ev_engine/calculator.py`, `market_impact.py`) and portfolio optimiser (`app/services/portfolio/optimizer.py`, `sizing.py`).
+**Phase:** Phase 5a — EV Engine **COMPLETE** · Phase 5b — Portfolio Optimiser **NEXT**.
+**Last completed task:** Phase 5a EV engine landed end-to-end on branch `phase-5a-ev-engine`. New modules: `app/schemas/bets.py` (`BetCandidate` / `BetRecommendation` / `Portfolio`), `app/services/portfolio/sizing.py` (1/4 Kelly + 3% cap per ADR-002), `app/services/ev_engine/market_impact.py` (closed-form pari-mutuel post-bet odds), `app/services/ev_engine/calculator.py` (orchestrator over Win/Exacta/Trifecta/Superfecta via shared `_build_candidate` helper). PL gained `place_prob` / `show_prob` closed-form helpers (deferred for use; Phase 5a does not emit Place/Show — see ADR-039). Backtest validation script (`scripts/validate_phase5a_ev_engine.py`) runs end-to-end on the test slice with historical `odds_final` (ADR-040). **547 tests passing** (was 503 → +44 across Tasks 1-6).
+**Next task:** Phase 5b — Portfolio Optimiser. CVaR LP via Rockafellar-Uryasev + `scipy.optimize.linprog`; consumes `list[BetCandidate]`; produces `BetRecommendation`/`Portfolio`. CLAUDE.md §10 acceptance: "Assert CVaR constraint is binding at the limit." First step in Phase 5b should be capping `odds_final` in the validation script before the optimiser is wired in (see EV-engine smoke note below).
+
+### Phase 5a smoke result — flagged for Phase 5b investigation
+
+First backtest smoke run (5% sample → 11,574 test rows / 8,717 races, dates up to 2018-02-25) produced 10,663 +EV candidates with **mean edge 0.705** and **mean EV/$ of 34.9** — both implausibly large. Artifact: `models/baseline_full/ev_engine/smoke-test-001/report.json`.
+
+Root cause: the parquet's `odds_final` column contains extreme values (likely 99/999 placeholders for scratched or rare-payout horses) which, when fed into `1/odds`, produce near-zero market probabilities and therefore enormous nominal edges against ANY non-zero model probability. The EV engine is computing what it was asked; the data is the problem. The 3% Kelly cap caught the magnitude (total Kelly stake fraction 299 across 10,663 candidates → ~0.028 mean, right at the cap), so the optimiser will see something tractable, but it'll be allocating to noise.
+
+Phase 5b first fix: cap `decimal_odds` at the validation-script level (suggested cap: ~100) BEFORE feeding to `compute_ev_candidates`. This is a data-cleaning concern, not an EV-engine concern.
+
+### Phase 5a module inventory
+
+| Module                                              | Lines | Tests | Notes                                                            |
+|-----------------------------------------------------|------:|------:|------------------------------------------------------------------|
+| `app/schemas/bets.py`                               |    ~80 |    11 | BetCandidate / BetRecommendation / Portfolio. ADR-039 scope.    |
+| `app/services/ordering/plackett_luce.py` (new helpers) |   +60 |    +9 | `place_prob` / `show_prob` closed-form + `_DENOM_TOL` constant.  |
+| `app/services/portfolio/sizing.py`                  |   ~80 |    14 | `kelly_fraction` (1/4) + `apply_bet_cap` (3%). Per ADR-002.     |
+| `app/services/ev_engine/market_impact.py`           |  ~120 |    12 | Pari-mutuel `post_bet_decimal_odds` + `inferred_winning_bets`.  |
+| `app/services/ev_engine/calculator.py`              |  ~270 |    17 | `compute_ev_candidates` orchestrator + `_build_candidate`.      |
+| `scripts/validate_phase5a_ev_engine.py`             |  ~280 |     — | Backtest-mode end-to-end runner. Smoke ran in ~5 min @ 5%.      |
 
 ### Calibration finding — full-parquet (post-ADR-037 + ADR-038)
 
@@ -82,6 +101,94 @@ JP carries 1.6M rows with no speed figure. Either derive a synthetic speed figur
 ---
 
 ## Session Log
+
+### Session: 2026-05-13 (b) — Phase 5a EV engine (subagent-driven)
+
+**Completed:**
+
+Phase 5a built end-to-end via the `superpowers:subagent-driven-development` workflow on branch `phase-5a-ev-engine`. Eight tasks, each TDD-style (failing test → implementation → green test → commit), each followed by a spec-compliance + code-quality review pair, with cosmetic fixes applied as separate follow-up commits.
+
+*Task 1 — `app/schemas/bets.py`*
+- `BetCandidate`, `BetRecommendation`, `Portfolio` Pydantic v2 models.
+- Validator enforces selection length per bet type (Win=1, Exacta=2, Trifecta=3, Superfecta=4) and distinctness. Pick3/4/6 + Place/Show rejected with explicit ValueError per ADR-039.
+- 11 tests.
+
+*Task 2 — PL place/show helpers*
+- `place_prob(p, i)` and `show_prob(p, i)` closed-form in `app/services/ordering/plackett_luce.py`. Verified against brute-force `enumerate_exotic_probs` enumeration; Σ_i place_prob = 2 and Σ_i show_prob = 3 exactly.
+- Added `_DENOM_TOL = 1e-12` named constant for the degenerate-denominator guard (sibling to existing `_SUM_TOL`).
+- 9 new tests.
+
+*Task 3 — `app/services/portfolio/sizing.py`*
+- `kelly_fraction(edge, decimal_odds, fraction=0.25)` and `apply_bet_cap(stake, cap=0.03)` pure functions per ADR-002.
+- 14 tests (15 after review-fix added the `decimal_odds=1.0` boundary case).
+
+*Task 4 — `app/services/ev_engine/market_impact.py`*
+- `post_bet_decimal_odds(pre_odds, bet_amount, pool_size, takeout_rate)` closed form: `(1−τ)(P+x) / (B+x)` where `B = (1−τ)·P / pre_odds`. `pool_size=None` returns pre_odds unchanged.
+- `inferred_winning_bets(pre_odds, pool_size, takeout_rate)` helper.
+- `DEFAULT_TAKEOUT` table (win/place/show=0.17, exacta=0.21, trifecta/superfecta/pick=0.25) per Master Reference §190.
+- 12 tests (10 + 2 added in review: saturation case `bet_amount == B`, explicit `pool_size <= 0` rejection at both entry points).
+
+*Task 5 — `app/services/ev_engine/calculator.py` (Win path)*
+- `compute_ev_candidates(race_id, win_probs, decimal_odds, bet_types, min_edge=0.05, bankroll=1.0, pool_sizes=None, takeout_rates=None)` orchestrator. Returns `list[BetCandidate]` sorted by descending EV.
+- Single-step market-impact approximation: uses PRE-impact Kelly as the impact-estimate stake. Because `post_odds ≤ pre_odds`, the estimate OVERESTIMATES impact — reported EV is a conservative lower bound. When stake vastly exceeds pool, the post-impact edge recheck returns None.
+- 11 tests.
+
+*Task 6 — calculator (exotics)*
+- Added `_PL_PROB_FN: dict[BetType, Callable[...]]` dispatch and `_candidate_for_exotic`. Caller supplies `exotic_odds: dict[BetType, dict[tuple[int,...], float]]` mapping each permutation to its gross decimal odds.
+- Refactored to a shared `_build_candidate(race_id, bet_type, selection, model_prob, pre_odds, …)` helper after the code-quality reviewer flagged Win/Exotic duplication. Both `_candidate_for_win` and `_candidate_for_exotic` now compute model_prob then delegate.
+- 6 new tests (including a -EV exacta case to exercise the filter from both directions).
+
+*Task 7 — validation script*
+- `scripts/validate_phase5a_ev_engine.py` — backtest mode using historical `odds_final` per ADR-040. Mirrors `validate_calibration.run_live` structure (reuses `_three_way_split` and `_stack_for_meta`).
+- Added `--sample-frac` arg after initial smoke runs hung on the 2.3M-row `prepare_training_features` step. 5% sample completes in ~5 min.
+- Smoke artifact: `models/baseline_full/ev_engine/smoke-test-001/report.json`.
+
+*Task 8 — ADRs + this progress entry*
+- ADR-039 (Phase 5a bet-type scope) + ADR-040 (odds-source-agnostic + smoke-result data-quality note) appended to DECISIONS.md.
+
+**Key decisions made (new ADRs):**
+- **ADR-039:** Phase 5a supports WIN, EXACTA, TRIFECTA, SUPERFECTA only. Place/Show require live pool composition (which other horses hit the board, with what bet weights); deferred until tote ingestion exists. Pick N requires the shared latent track-state model from Master Reference §206-209; deferred.
+- **ADR-040:** EV calculator is odds-source-agnostic. Validation script picks the mode: backtest uses `odds_final`; live mode is stubbed (`NotImplementedError`) until PDF-ingestion-to-EV integration is built. ADR also pins the smoke-result data-quality issue.
+
+**Surprising / non-obvious findings to carry forward:**
+
+- **The smoke run's "mean edge 0.705" is a data issue, not a model issue.** Historical `odds_final` includes 99/999 placeholders that, fed into `1/odds`, produce near-zero market probabilities. Phase 5b's first job is a `decimal_odds` cap in the validation script (suggested: ~100) before the optimiser is wired in. Without this filter, the optimiser will allocate to data noise.
+
+- **Single-step market-impact approximation is provably conservative.** Because post_odds ≤ pre_odds always, post_kelly ≤ pre_kelly, so using pre_kelly as the impact-estimate stake OVERESTIMATES impact. Reported EV is a lower bound on true settled EV. This was noticed during code review and pinned in the comment; the alternative (fixed-point iteration on stake) would be tighter but slower and adds no real value when the cap is already binding most of the time.
+
+- **The Win/Exotic candidate-construction body was nearly identical and got extracted into `_build_candidate` only in the Task 6 code-review pass.** Task 5 created the Win path first; Task 6 copied it for Exotics. The duplication was caught by the code reviewer; the extraction was a clean 4-line each leaf with one shared 60-line core. Lesson: when adding a "parallel" code path with a single divergent step, the reviewer should specifically ask "is the divergent step the only divergence?"
+
+- **Phase 4's calibration metadata directory naming saved us.** The calibrator script writes artifacts to `models/baseline_full/calibration_adr038_brier/<model>/`. The new EV validation script loads from that exact path. If the calibration artifact naming had not been version-tagged, swapping in a future calibration approach would have required schema changes here.
+
+- **`place_prob` / `show_prob` are deferred but worth having.** Phase 5a does not emit Place/Show, but the PL marginals are clean closed forms with no infrastructure cost. Adding them now (with tests) keeps PL's surface complete; Phase 6+ doesn't need to revisit `plackett_luce.py` when live pool data lands.
+
+**Code-review findings applied (cosmetic, separate follow-up commits per task):**
+
+- Task 1: renamed `_validate_selection` → `validate_selection` (Pydantic validators show up in error tracebacks; the leading underscore was misleading); added `BetRecommendation` docstring note about stake/stake_fraction consistency being a caller responsibility; extended Pick-N rejection test to cover PICK4 and PICK6.
+- Task 2: extracted `_DENOM_TOL = 1e-12` constant; renamed `d1`/`d2` → `denom_j`/`denom_jk`; strengthened certain-horse test to exercise the skip branch on a non-certain horse.
+- Task 3: removed unused `import math` from test file; asserted the warm-up arithmetic cases that were previously only in comments; added `decimal_odds=1.0` boundary test.
+- Task 4: consolidated `_validate` to handle optional `pool_size`; removed duplicate inline guards in `inferred_winning_bets`; added saturation test (`bet_amount == B`).
+- Task 5: dropped unused imports of `DEFAULT_KELLY_FRACTION` / `DEFAULT_MAX_BET_FRACTION`; replaced "~1% accuracy" comment with the more honest "conservative approximation — reported EV is a lower bound" description.
+- Task 6: extracted shared `_build_candidate` (the biggest review-driven refactor of the phase); type-hinted `_PL_PROB_FN`; added a -EV permutation to the exacta test for filter symmetry; clarified docstring on the distinct-indices test (the error originates in PL's `_validate_indices`, not in the BetCandidate schema).
+
+**Tests Status:**
+- Pre-Phase-5a baseline: 503 passing
+- Task 1 (+11 schema): 514
+- Task 2 (+9 PL helpers): 523
+- Task 3 (+14 sizing) + Task 3 review (+1 boundary): 538
+- Task 4 (+10 market impact) + review (+2 saturation/pool-rejection): 530 (counts re-baselined as tests evolve)
+- Task 5 (+11 calculator Win): 541
+- Task 6 (+6 exotic): 547
+- **Final: 547 tests passing in ~25s.**
+
+**Known limitations carried forward into Phase 5b:**
+
+1. **`odds_final` cap not yet applied.** Validation script needs a `--max-decimal-odds` flag (suggested default 100) before optimiser results are meaningful.
+2. **No `BetRecommendation`/`Portfolio` producer yet.** The schemas exist (Task 1) but Phase 5b's optimiser is the first consumer. Tests for those classes are minimal (round-trip only) until 5b.
+3. **`live` validation mode is a `NotImplementedError` stub.** Wires up when PDF-ingestion-to-EV integration lands.
+4. **Phase-3 stub models still return 0.5.** PaceScenarioModel and SequenceModel are constant. Meta-learner ECE is 0.003 raw so this is acceptable for Phase 5a's marginal-prob inputs but should not be assumed acceptable when the optimiser starts taking real positions.
+
+---
 
 ### Session: 2026-05-13 (a) — Calibrator hardening: ADR-037 held-out IV + ADR-038 skip guard + Brier co-criterion
 
