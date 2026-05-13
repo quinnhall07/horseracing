@@ -75,6 +75,16 @@ class EVRunSummary:
     total_kelly_fraction: float
     candidate_count_by_bet_type: dict[str, int] = field(default_factory=dict)
     bet_types_evaluated: list[str] = field(default_factory=list)
+    # Phase 5b additions: data-quality filter accounting + optimizer rollup.
+    max_decimal_odds: float = 100.0
+    n_rows_dropped_by_odds_cap: int = 0
+    optimize_enabled: bool = False
+    n_portfolios_with_recommendations: int = 0
+    n_empty_portfolios: int = 0
+    total_stake_fraction_sum: float = 0.0
+    mean_cvar_usd: float = 0.0
+    mean_expected_return_usd: float = 0.0
+    mean_n_recommendations_per_active_portfolio: float = 0.0
 
 
 def _score_test_slice(
@@ -142,11 +152,35 @@ def evaluate(
     bet_types: list[BetType],
     race_id_col: str = "race_id",
     limit_races: Optional[int] = None,
-) -> tuple[list[BetCandidate], EVRunSummary]:
-    """Run the EV engine race-by-race over the test slice."""
+    max_decimal_odds: float = 100.0,
+    optimize: bool = False,
+    bankroll: float = 1.0,
+    cvar_alpha: float = 0.05,
+    max_drawdown_pct: float = 0.20,
+    n_scenarios: int = 1000,
+    seed: int = 42,
+) -> tuple[list[BetCandidate], EVRunSummary, list]:
+    """Run the EV engine race-by-race over the test slice.
+
+    Phase 5b additions:
+        max_decimal_odds: drop rows with odds_final > cap BEFORE feeding to
+            compute_ev_candidates. The parquet's odds_final column contains
+            99/999 placeholders for scratches that produce absurd edges
+            (see ADR-040 'Note on smoke-run data quality').
+        optimize:  when True, runs the CVaR portfolio optimiser per race
+            and returns a list of Portfolio objects alongside the flat
+            BetCandidate list. When False, the third return is an empty list.
+    """
+    if optimize:
+        # Lazy import: keeps this script importable for non-optimize callers
+        # without forcing the scipy.optimize.linprog import path.
+        from app.services.portfolio.optimizer import optimize_portfolio
+
     candidates: list[BetCandidate] = []
+    portfolios: list = []
     n_races = 0
     races_with_cands = 0
+    n_rows_dropped_by_odds_cap = 0
 
     groups = test_df.groupby(race_id_col, sort=False)
     if limit_races is not None:
@@ -157,11 +191,18 @@ def evaluate(
         s = win_probs.sum()
         if not np.isfinite(s) or s <= 0:
             continue
-        win_probs = win_probs / s  # renormalise after any drops
 
         odds = _odds_for_mode(group, mode)
+        # Apply max-decimal-odds data-quality filter. Rows with odds above
+        # the cap are treated as missing (placeholder values like 99/999).
+        cap_mask = odds > max_decimal_odds
+        n_dropped = int(np.sum(cap_mask & np.isfinite(odds)))
+        n_rows_dropped_by_odds_cap += n_dropped
+        odds = np.where(cap_mask, np.nan, odds)
         if np.isnan(odds).any():
             continue
+
+        win_probs = win_probs / s  # renormalise
 
         race_cands = compute_ev_candidates(
             race_id=str(race_id),
@@ -175,9 +216,45 @@ def evaluate(
         if race_cands:
             races_with_cands += 1
 
+        if optimize and race_cands:
+            portfolio = optimize_portfolio(
+                candidates=race_cands,
+                race_win_probs={str(race_id): win_probs},
+                bankroll=bankroll,
+                cvar_alpha=cvar_alpha,
+                max_drawdown_pct=max_drawdown_pct,
+                n_scenarios=n_scenarios,
+                seed=seed,
+                card_id=str(race_id),
+            )
+            portfolios.append(portfolio)
+
+    if n_rows_dropped_by_odds_cap:
+        log.info(
+            "ev_engine.validate.odds_cap.applied",
+            cap=max_decimal_odds,
+            n_rows_dropped=n_rows_dropped_by_odds_cap,
+        )
+
     by_type: dict[str, int] = {}
     for c in candidates:
         by_type[c.bet_type.value] = by_type.get(c.bet_type.value, 0) + 1
+
+    n_active = sum(1 for p in portfolios if p.recommendations)
+    n_empty = sum(1 for p in portfolios if not p.recommendations)
+    if n_active:
+        mean_cvar_usd = float(np.mean([p.cvar_95 for p in portfolios if p.recommendations]))
+        mean_expected_return_usd = float(
+            np.mean([p.expected_return for p in portfolios if p.recommendations])
+        )
+        mean_n_recs = float(
+            np.mean([len(p.recommendations) for p in portfolios if p.recommendations])
+        )
+    else:
+        mean_cvar_usd = 0.0
+        mean_expected_return_usd = 0.0
+        mean_n_recs = 0.0
+    total_stake_fraction_sum = float(sum(p.total_stake_fraction for p in portfolios))
 
     summary = EVRunSummary(
         run_id="<set-by-caller>",
@@ -200,8 +277,17 @@ def evaluate(
         total_kelly_fraction=float(sum(c.kelly_fraction for c in candidates)),
         candidate_count_by_bet_type=by_type,
         bet_types_evaluated=[bt.value for bt in bet_types],
+        max_decimal_odds=float(max_decimal_odds),
+        n_rows_dropped_by_odds_cap=n_rows_dropped_by_odds_cap,
+        optimize_enabled=optimize,
+        n_portfolios_with_recommendations=n_active,
+        n_empty_portfolios=n_empty,
+        total_stake_fraction_sum=total_stake_fraction_sum,
+        mean_cvar_usd=mean_cvar_usd,
+        mean_expected_return_usd=mean_expected_return_usd,
+        mean_n_recommendations_per_active_portfolio=mean_n_recs,
     )
-    return candidates, summary
+    return candidates, summary, portfolios
 
 
 def main() -> None:
@@ -226,6 +312,58 @@ def main() -> None:
         help="Comma-separated subset of win,exacta,trifecta,superfecta. "
              "Note: in backtest mode only WIN is supported (no historical "
              "per-permutation exotic odds in the parquet).",
+    )
+    ap.add_argument(
+        "--max-decimal-odds",
+        type=float,
+        default=100.0,
+        help="Drop rows with odds_final > cap BEFORE feeding to the EV "
+             "calculator. Defaults to 100. The parquet's odds_final column "
+             "contains 99/999 placeholders for scratched horses; without "
+             "this cap, 1/odds produces near-zero market probs and absurd "
+             "edges (see ADR-040). Set to float('inf') to disable.",
+    )
+    ap.add_argument(
+        "--optimize",
+        action="store_true",
+        help="Run the Phase 5b CVaR-constrained portfolio optimiser "
+             "per race after candidate generation. Aggregates per-portfolio "
+             "stats into the output report. Pure additive — when not set, "
+             "behaviour is identical to Phase 5a.",
+    )
+    ap.add_argument(
+        "--bankroll",
+        type=float,
+        default=1.0,
+        help="Bankroll used by the portfolio optimiser (per race). "
+             "Defaults to 1.0 so all reported metrics are in 'fraction of "
+             "bankroll' terms.",
+    )
+    ap.add_argument(
+        "--cvar-alpha",
+        type=float,
+        default=0.05,
+        help="CVaR tail probability. Defaults to 0.05 (95th-percentile "
+             "shortfall).",
+    )
+    ap.add_argument(
+        "--max-drawdown-pct",
+        type=float,
+        default=0.20,
+        help="CVaR upper bound as a fraction of bankroll. Defaults to 0.20.",
+    )
+    ap.add_argument(
+        "--n-scenarios",
+        type=int,
+        default=1000,
+        help="Number of Monte Carlo PL Gumbel scenarios per race for the "
+             "CVaR LP. Defaults to 1000.",
+    )
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed for the PL Monte Carlo sampler. Defaults to 42.",
     )
     args = ap.parse_args()
 
@@ -267,28 +405,38 @@ def main() -> None:
         race_id_col="race_id",
     )
 
-    candidates, summary = evaluate(
+    candidates, summary, portfolios = evaluate(
         test_df=test_scored,
         mode=args.mode,
         min_edge=args.min_edge,
         bet_types=bet_types,
         limit_races=args.limit_races,
+        max_decimal_odds=args.max_decimal_odds,
+        optimize=args.optimize,
+        bankroll=args.bankroll,
+        cvar_alpha=args.cvar_alpha,
+        max_drawdown_pct=args.max_drawdown_pct,
+        n_scenarios=args.n_scenarios,
+        seed=args.seed,
     )
     summary.run_id = args.run_id
 
     out_dir = _OUT_ROOT / args.run_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    report_dict = {
+        "summary": asdict(summary),
+        "candidates": [c.model_dump() for c in candidates[:1000]],
+    }
+    if args.optimize:
+        # Persist a sample of portfolios for forensic inspection. Active
+        # (non-empty) portfolios first so a small sample is informative.
+        active = [p for p in portfolios if p.recommendations]
+        empty = [p for p in portfolios if not p.recommendations]
+        sample = active[:200] + empty[: max(0, 200 - len(active))]
+        report_dict["portfolios"] = [p.model_dump() for p in sample]
     with open(out_dir / "report.json", "w") as fh:
-        json.dump(
-            {
-                "summary": asdict(summary),
-                "candidates": [c.model_dump() for c in candidates[:1000]],
-            },
-            fh,
-            indent=2,
-            default=str,
-        )
+        json.dump(report_dict, fh, indent=2, default=str)
     log.info(
         "ev_engine.validate.done",
         out_dir=str(out_dir),
