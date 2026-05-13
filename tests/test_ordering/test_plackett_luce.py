@@ -326,3 +326,7 @@ def test_place_prob_certain_horse():
 
     p = np.array([1.0, 0.0, 0.0])
     assert place_prob(p, 0) == pytest.approx(1.0)
+    # The skip branch (denom <= _DENOM_TOL) is exercised here: a non-certain
+    # horse cannot place behind a horse that wins with probability 1.
+    assert place_prob(p, 1) == pytest.approx(0.0)
+    assert place_prob(p, 2) == pytest.approx(0.0)
