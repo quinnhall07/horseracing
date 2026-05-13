@@ -27,7 +27,7 @@ Public API:
     compute_ev_candidates(
         race_id, win_probs, decimal_odds, bet_types,
         min_edge=DEFAULT_MIN_EDGE, bankroll=1.0,
-        pool_sizes=None, takeout_rates=None,
+        pool_sizes=None, takeout_rates=None, exotic_odds=None,
     ) -> list[BetCandidate]
 """
 
@@ -43,6 +43,11 @@ from app.schemas.race import BetType
 from app.services.ev_engine.market_impact import (
     DEFAULT_TAKEOUT,
     post_bet_decimal_odds,
+)
+from app.services.ordering.plackett_luce import (
+    exacta_prob,
+    trifecta_prob,
+    superfecta_prob,
 )
 from app.services.portfolio.sizing import apply_bet_cap, kelly_fraction
 
@@ -145,6 +150,72 @@ def _candidate_for_win(
     )
 
 
+_PL_PROB_FN = {
+    BetType.EXACTA: lambda p, sel: exacta_prob(p, sel[0], sel[1]),
+    BetType.TRIFECTA: lambda p, sel: trifecta_prob(p, sel[0], sel[1], sel[2]),
+    BetType.SUPERFECTA: lambda p, sel: superfecta_prob(p, sel[0], sel[1], sel[2], sel[3]),
+}
+
+
+def _candidate_for_exotic(
+    race_id: str,
+    bet_type: BetType,
+    selection: tuple[int, ...],
+    win_probs: np.ndarray,
+    pre_odds: float,
+    bankroll: float,
+    pool_size: Optional[float],
+    takeout_rate: float,
+    min_edge: float,
+) -> Optional[BetCandidate]:
+    """Build a single exotic BetCandidate. Returns None if edge < min_edge."""
+    pl_fn = _PL_PROB_FN[bet_type]
+    model_prob = float(pl_fn(win_probs, selection))
+
+    pre_market_prob = 1.0 / pre_odds
+    pre_edge = model_prob - pre_market_prob
+    if pre_edge < min_edge:
+        return None
+
+    if pool_size is not None:
+        pre_kelly = kelly_fraction(pre_edge, pre_odds)
+        pre_stake_frac = apply_bet_cap(pre_kelly)
+        pre_stake = pre_stake_frac * bankroll
+        decimal_odds = post_bet_decimal_odds(
+            pre_odds=pre_odds,
+            bet_amount=pre_stake,
+            pool_size=pool_size,
+            takeout_rate=takeout_rate,
+        )
+        market_impact_applied = True
+    else:
+        decimal_odds = pre_odds
+        market_impact_applied = False
+
+    market_prob = 1.0 / decimal_odds
+    edge = model_prob - market_prob
+    if edge < min_edge:
+        return None
+
+    ev = expected_value_per_dollar(model_prob, decimal_odds)
+    kelly = kelly_fraction(edge, decimal_odds)
+    kelly_capped = apply_bet_cap(kelly)
+
+    return BetCandidate(
+        race_id=race_id,
+        bet_type=bet_type,
+        selection=selection,
+        model_prob=model_prob,
+        decimal_odds=float(decimal_odds),
+        market_prob=float(market_prob),
+        edge=float(edge),
+        expected_value=float(ev),
+        kelly_fraction=float(kelly_capped),
+        market_impact_applied=market_impact_applied,
+        pool_size=pool_size,
+    )
+
+
 def compute_ev_candidates(
     race_id: str,
     win_probs: np.ndarray,
@@ -154,27 +225,20 @@ def compute_ev_candidates(
     bankroll: float = 1.0,
     pool_sizes: Optional[dict[BetType, Optional[float]]] = None,
     takeout_rates: Optional[dict[BetType, float]] = None,
+    exotic_odds: Optional[dict[BetType, dict[tuple[int, ...], float]]] = None,
 ) -> list[BetCandidate]:
     """Generate all +EV BetCandidate objects for a single race.
 
     Args:
-        race_id:      string identifier (used as-is on output).
-        win_probs:    length-N calibrated marginal P(win) per horse. Must
-                      sum to 1.
-        decimal_odds: length-N parallel array of decimal odds (gross). For
-                      Win, decimal_odds[i] is the public price on horse i.
-                      Exacta/Trifecta/Superfecta odds are NOT in this array;
-                      they are computed in Task 6 from PL marginals + a
-                      per-permutation gross-odds dict (added later).
-        bet_types:    iterable of BetType enums to evaluate.
-        min_edge:     minimum edge to include in output. Default 0.05.
-        bankroll:     used only to compute the dollar stake for market
-                      impact estimation. Pure-prob outputs do not depend
-                      on this. Default 1.0 (treat outputs as fractions).
-        pool_sizes:   optional dict mapping BetType → pool size in $. When
-                      provided, market impact is applied. Default None.
-        takeout_rates: optional dict overriding `DEFAULT_TAKEOUT` per bet
-                      type.
+        race_id, win_probs, decimal_odds: as before. decimal_odds is used
+            only for Win-pool bets; exotics use `exotic_odds`.
+        bet_types: iterable of BetType enums to evaluate.
+        min_edge:  minimum edge to include. Default 0.05.
+        bankroll:  used for dollar-stake estimation in market impact. Default 1.0.
+        pool_sizes: dict mapping BetType → pool size in $. None disables impact.
+        takeout_rates: dict overriding DEFAULT_TAKEOUT per bet type.
+        exotic_odds:   dict[BetType, dict[selection-tuple, decimal_odds]]
+                       Required for EXACTA / TRIFECTA / SUPERFECTA.
 
     Returns:
         List of BetCandidate sorted by descending expected_value.
@@ -185,6 +249,7 @@ def compute_ev_candidates(
 
     pool_sizes = pool_sizes or {}
     takeout_rates = takeout_rates or {}
+    exotic_odds = exotic_odds or {}
 
     candidates: list[BetCandidate] = []
 
@@ -207,9 +272,25 @@ def compute_ev_candidates(
                 if c is not None:
                     candidates.append(c)
         elif bet_type in (BetType.EXACTA, BetType.TRIFECTA, BetType.SUPERFECTA):
-            # Task 6 — exotic candidates. Stub for Task 5 only.
-            log.debug("ev_calculator.exotic_skipped", bet_type=bet_type)
-            continue
+            if bet_type not in exotic_odds:
+                raise ValueError(
+                    f"exotic_odds dict required for {bet_type}; "
+                    f"caller must supply per-permutation gross decimal odds."
+                )
+            for selection, pre_odds in exotic_odds[bet_type].items():
+                c = _candidate_for_exotic(
+                    race_id=race_id,
+                    bet_type=bet_type,
+                    selection=tuple(selection),
+                    win_probs=win_probs,
+                    pre_odds=float(pre_odds),
+                    bankroll=bankroll,
+                    pool_size=pool_size,
+                    takeout_rate=takeout,
+                    min_edge=min_edge,
+                )
+                if c is not None:
+                    candidates.append(c)
         else:
             raise ValueError(
                 f"bet_type {bet_type} not supported in Phase 5a "

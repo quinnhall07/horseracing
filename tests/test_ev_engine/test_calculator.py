@@ -154,3 +154,143 @@ def test_market_impact_lowers_post_odds_in_candidate():
     assert with_impact[0].expected_value < no_impact[0].expected_value
     assert with_impact[0].market_impact_applied is True
     assert no_impact[0].market_impact_applied is False
+
+
+# ── Exotic bets ────────────────────────────────────────────────────────────
+
+
+def test_compute_exacta_candidates_from_exotic_odds_dict():
+    """Caller supplies per-permutation gross odds; calculator filters by edge."""
+    from app.services.ev_engine.calculator import compute_ev_candidates
+
+    win_probs = np.array([0.50, 0.30, 0.20])
+    # Public exacta odds (gross decimal); we make horse-0-1 very generous.
+    exotic_odds = {
+        BetType.EXACTA: {
+            (0, 1): 8.0,   # PL prob: 0.50 * 0.30 / 0.50 = 0.30; market 0.125; edge 0.175 → PASS
+            (0, 2): 12.0,  # PL prob: 0.50 * 0.20 / 0.50 = 0.20; market 0.083; edge 0.117 → PASS
+            (1, 0): 8.0,   # PL prob: 0.30 * 0.50 / 0.70 ≈ 0.214; market 0.125; edge 0.089 → PASS
+            (1, 2): 30.0,  # PL prob: 0.30 * 0.20 / 0.70 ≈ 0.0857; market 0.033; edge 0.052 → PASS
+        }
+    }
+    candidates = compute_ev_candidates(
+        race_id="R1",
+        win_probs=win_probs,
+        decimal_odds=np.array([2.0, 3.5, 5.0]),
+        bet_types=[BetType.EXACTA],
+        min_edge=0.05,
+        exotic_odds=exotic_odds,
+    )
+    selections = {c.selection for c in candidates}
+    # All four permutations have edge >= 0.05 per the math above.
+    assert selections == {(0, 1), (0, 2), (1, 0), (1, 2)}
+
+
+def test_compute_trifecta_candidates():
+    from app.services.ev_engine.calculator import compute_ev_candidates
+
+    win_probs = np.array([0.50, 0.30, 0.15, 0.05])
+    # Pick one strongly +EV trifecta and one -EV; calculator must filter.
+    exotic_odds = {
+        BetType.TRIFECTA: {
+            (0, 1, 2): 30.0,   # PL: 0.50 * (0.30/0.50) * (0.15/0.20) = 0.225;
+                               #     market: 0.0333; edge: 0.19 → PASS
+            (0, 1, 3): 200.0,  # PL: 0.50 * (0.30/0.50) * (0.05/0.20) = 0.075;
+                               #     market: 0.005; edge: 0.07 → PASS
+            (3, 2, 1): 100.0,  # PL: 0.05 * (0.15/0.95) * (0.30/0.80) ≈ 0.00296;
+                               #     market: 0.01; edge: ≈-0.007 → FAIL
+        }
+    }
+    candidates = compute_ev_candidates(
+        race_id="R1",
+        win_probs=win_probs,
+        decimal_odds=np.array([2.0, 3.3, 6.7, 20.0]),
+        bet_types=[BetType.TRIFECTA],
+        min_edge=0.05,
+        exotic_odds=exotic_odds,
+    )
+    selections = {c.selection for c in candidates}
+    assert selections == {(0, 1, 2), (0, 1, 3)}
+
+
+def test_compute_superfecta_candidate():
+    from app.services.ev_engine.calculator import compute_ev_candidates
+
+    win_probs = np.array([0.40, 0.30, 0.20, 0.10])
+    exotic_odds = {
+        BetType.SUPERFECTA: {
+            (0, 1, 2, 3): 50.0,  # PL: 0.40 * (0.30/0.60) * (0.20/0.30) * (0.10/0.10)
+                                 #     = 0.40 * 0.5 * 0.667 * 1.0 = 0.1333
+                                 # market: 0.02; edge: 0.1133 → PASS
+        }
+    }
+    candidates = compute_ev_candidates(
+        race_id="R1",
+        win_probs=win_probs,
+        decimal_odds=np.array([2.5, 3.3, 5.0, 10.0]),
+        bet_types=[BetType.SUPERFECTA],
+        min_edge=0.05,
+        exotic_odds=exotic_odds,
+    )
+    assert len(candidates) == 1
+    assert candidates[0].selection == (0, 1, 2, 3)
+    assert candidates[0].edge == pytest.approx(0.1133, abs=1e-3)
+
+
+def test_exotic_bet_without_odds_dict_raises():
+    from app.services.ev_engine.calculator import compute_ev_candidates
+
+    with pytest.raises(ValueError, match="exotic_odds"):
+        compute_ev_candidates(
+            race_id="R1",
+            win_probs=np.array([0.5, 0.3, 0.2]),
+            decimal_odds=np.array([2.0, 3.3, 5.0]),
+            bet_types=[BetType.EXACTA],
+            min_edge=0.05,
+            exotic_odds=None,
+        )
+
+
+def test_exotic_market_impact_reduces_ev():
+    """Same as Win market-impact test, but for an exotic pool."""
+    from app.services.ev_engine.calculator import compute_ev_candidates
+
+    win_probs = np.array([0.50, 0.30, 0.20])
+    exotic_odds = {BetType.EXACTA: {(0, 1): 8.0}}
+
+    no_impact = compute_ev_candidates(
+        race_id="R1",
+        win_probs=win_probs,
+        decimal_odds=np.array([2.0, 3.3, 5.0]),
+        bet_types=[BetType.EXACTA],
+        min_edge=0.05,
+        exotic_odds=exotic_odds,
+        bankroll=10_000.0,
+        pool_sizes={BetType.EXACTA: None},
+    )
+    with_impact = compute_ev_candidates(
+        race_id="R1",
+        win_probs=win_probs,
+        decimal_odds=np.array([2.0, 3.3, 5.0]),
+        bet_types=[BetType.EXACTA],
+        min_edge=0.05,
+        exotic_odds=exotic_odds,
+        bankroll=10_000.0,
+        pool_sizes={BetType.EXACTA: 5_000.0},
+    )
+    assert with_impact[0].expected_value < no_impact[0].expected_value
+
+
+def test_exotic_selection_validates_distinct_indices():
+    """The schema enforces distinctness; bad caller data should raise."""
+    from app.services.ev_engine.calculator import compute_ev_candidates
+
+    with pytest.raises(ValueError):
+        compute_ev_candidates(
+            race_id="R1",
+            win_probs=np.array([0.5, 0.3, 0.2]),
+            decimal_odds=np.array([2.0, 3.3, 5.0]),
+            bet_types=[BetType.EXACTA],
+            min_edge=0.05,
+            exotic_odds={BetType.EXACTA: {(0, 0): 10.0}},  # repeated index
+        )
