@@ -200,17 +200,22 @@ def test_auto_picks_isotonic_when_distortion_is_non_sigmoidal():
     assert cal.auto_selection_mode == "held_out"
 
 
-def test_auto_picks_platt_on_already_calibrated_stream():
+def test_auto_picks_platt_over_isotonic_on_already_calibrated_when_skip_disabled():
     """When raw scores are ALREADY well-calibrated probabilities, isotonic
-    can only overfit. Held-out auto-selector should pick Platt (the simpler
-    model) — confirming the ADR-037 fix.
+    can only overfit. With the skip guard disabled, the held-out auto-
+    selector should pick Platt (the simpler model) — confirming the
+    ADR-037 isotonic-vs-Platt fix in isolation. (With the skip guard
+    enabled at default, identity wins on this stream — see
+    test_auto_skips_calibration_when_raw_is_already_calibrated.)
     """
     rng = np.random.default_rng(2026)
     n = 4000
     raw = rng.uniform(0.05, 0.6, n)
     # True P = raw (perfectly calibrated already).
     labels = (rng.uniform(0, 1, n) < raw).astype(int)
-    cal = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
+    cal = Calibrator(
+        CalibratorConfig(method="auto", skip_threshold_delta=-1.0, brier_skip_delta=-1.0)
+    ).fit(raw, labels)
     assert cal.chosen_method == "platt"
     assert cal.auto_selection_mode == "held_out"
 
@@ -252,9 +257,277 @@ def test_auto_min_delta_ece_protects_against_noise_swap():
     labels = (rng.uniform(0, 1, n) < true_p).astype(int)
     # With a generous min_delta=0.1 (=10% ECE advantage required), Platt
     # should always win — no real-world distortion gives that gap on
-    # this synthetic.
-    cal = Calibrator(CalibratorConfig(method="auto", auto_min_delta_ece=0.1)).fit(raw, labels)
+    # this synthetic. Also disable skip-when-calibrated so the test
+    # specifically exercises the platt-vs-iso branch.
+    cal = Calibrator(
+        CalibratorConfig(method="auto", auto_min_delta_ece=0.1, skip_threshold_delta=0.0)
+    ).fit(raw, labels)
     assert cal.chosen_method == "platt"
+
+
+# ── Skip-when-calibrated guard (ADR-038) ──────────────────────────────────
+
+
+def test_auto_skips_calibration_when_raw_is_already_calibrated():
+    """Stream where raw scores ARE the true win probabilities: neither
+    Platt nor isotonic can meaningfully improve on raw, so the
+    skip-when-calibrated guard should fire and chosen_method == 'identity'.
+    """
+    rng = np.random.default_rng(42)
+    n = 5000
+    # Raw scores are already perfectly calibrated probabilities.
+    raw = rng.uniform(0.05, 0.6, n)
+    labels = (rng.uniform(0, 1, n) < raw).astype(int)
+    cal = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
+    assert cal.chosen_method == "identity"
+    assert cal.auto_selection_mode == "held_out"
+    # identity ECE recorded on inner-val too.
+    assert "identity" in (cal.inner_val_metrics or {})
+    # And on the full fit slice for diagnostic comparison.
+    assert "identity" in (cal.metrics or {})
+
+
+def test_identity_predict_proba_returns_raw_scores_clipped():
+    """When chosen_method == 'identity', predict_proba returns raw input
+    clipped to [0, 1] — no calibration applied."""
+    rng = np.random.default_rng(7)
+    n = 4000
+    raw = rng.uniform(0.05, 0.6, n)
+    labels = (rng.uniform(0, 1, n) < raw).astype(int)
+    cal = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
+    assert cal.chosen_method == "identity"
+    out = cal.predict_proba(raw)
+    np.testing.assert_array_equal(out, np.clip(raw, 0.0, 1.0))
+    # Out-of-range inputs are clipped — predict_proba never escapes [0, 1].
+    weird = np.array([-0.5, 0.0, 0.3, 1.0, 1.5])
+    out = cal.predict_proba(weird)
+    np.testing.assert_array_equal(out, np.clip(weird, 0.0, 1.0))
+
+
+def test_skip_does_not_fire_on_clearly_uncalibrated_stream():
+    """When the raw stream is truly miscalibrated (staircase distortion),
+    isotonic should beat raw by more than skip_threshold_delta and the
+    skip guard should NOT fire."""
+    rng = np.random.default_rng(13)
+    n = 3000
+    raw = rng.uniform(0, 1, n)
+    true_p = np.where(raw < 0.33, 0.1, np.where(raw < 0.66, 0.5, 0.9))
+    labels = (rng.uniform(0, 1, n) < true_p).astype(int)
+    cal = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
+    assert cal.chosen_method == "isotonic"
+
+
+def test_skip_threshold_tunes_how_much_improvement_required():
+    """skip_threshold_delta tunes the minimum ECE advantage a calibrator
+    must show over raw on inner-val:
+        * Large positive (e.g. 0.5): skip almost always fires — even a
+          clear isotonic win on a staircase doesn't meet the bar.
+        * Default (0.001): tiny tie-band biased toward identity — clear
+          wins still pass through.
+    """
+    rng = np.random.default_rng(13)
+    n = 3000
+    # Clearly miscalibrated stream — both Platt and isotonic should
+    # comfortably beat raw, so default skip does NOT fire.
+    raw = rng.uniform(0, 1, n)
+    true_p = np.where(raw < 0.33, 0.1, np.where(raw < 0.66, 0.5, 0.9))
+    labels = (rng.uniform(0, 1, n) < true_p).astype(int)
+
+    cal_default = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
+    assert cal_default.chosen_method != "identity"
+
+    # Aggressive skip — calibration must beat raw by 0.5 ECE; impossible
+    # in practice, so identity always wins.
+    cal_aggressive = Calibrator(
+        CalibratorConfig(method="auto", skip_threshold_delta=0.5)
+    ).fit(raw, labels)
+    assert cal_aggressive.chosen_method == "identity"
+
+
+def test_identity_save_and_load_round_trip(tmp_path: Path):
+    """Identity chosen_method survives save/load and predict_proba still
+    returns clipped raw."""
+    rng = np.random.default_rng(2027)
+    n = 4000
+    raw = rng.uniform(0.05, 0.6, n)
+    labels = (rng.uniform(0, 1, n) < raw).astype(int)
+    cal = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
+    assert cal.chosen_method == "identity"
+
+    artifact_dir = tmp_path / "calibrator_identity"
+    cal.save(artifact_dir)
+    restored = Calibrator.load(artifact_dir)
+    assert restored.chosen_method == "identity"
+    p_before = cal.predict_proba(raw[:50])
+    p_after = restored.predict_proba(raw[:50])
+    np.testing.assert_array_equal(p_before, p_after)
+
+
+# ── Time-ordered inner-val indices (ADR-038) ──────────────────────────────
+
+
+def test_caller_supplied_inner_val_indices_records_held_out_caller_mode():
+    raw, labels = _biased_synthetic(n=4000)
+    n = len(raw)
+    iv_idx = np.arange(n - 800, n)  # last 800 rows as inner-val
+    cal = Calibrator(CalibratorConfig(method="auto")).fit(
+        raw, labels, inner_val_indices=iv_idx
+    )
+    assert cal.auto_selection_mode == "held_out_caller"
+    iv = cal.inner_val_metrics
+    assert iv is not None
+    assert iv["platt"]["n_val"] == 800
+    assert iv["isotonic"]["n_val"] == 800
+    assert iv["identity"]["n_val"] == 800
+
+
+def test_caller_supplied_inner_val_indices_change_selection():
+    """Use a synthetic where the calib slice contains a regime shift:
+    first half is staircase (favours isotonic), second half is well-
+    calibrated (favours skip). Time-ordered tail (= second half) should
+    pick 'identity'; random shuffle would mix both regimes and pick a
+    different method."""
+    rng = np.random.default_rng(2026)
+    n_each = 3000
+    # Block A — staircase, favours isotonic.
+    raw_a = rng.uniform(0, 1, n_each)
+    p_a = np.where(raw_a < 0.33, 0.1, np.where(raw_a < 0.66, 0.5, 0.9))
+    lab_a = (rng.uniform(0, 1, n_each) < p_a).astype(int)
+    # Block B — already calibrated.
+    raw_b = rng.uniform(0.05, 0.6, n_each)
+    lab_b = (rng.uniform(0, 1, n_each) < raw_b).astype(int)
+
+    raw = np.concatenate([raw_a, raw_b])
+    lab = np.concatenate([lab_a, lab_b]).astype(int)
+
+    # Time-ordered tail (= second half) is in the calibrated regime →
+    # skip should fire on that inner-val.
+    iv_idx = np.arange(n_each, 2 * n_each)
+    cal_tail = Calibrator(CalibratorConfig(method="auto")).fit(
+        raw, lab, inner_val_indices=iv_idx
+    )
+    assert cal_tail.chosen_method == "identity"
+    assert cal_tail.auto_selection_mode == "held_out_caller"
+
+    # Random seeded shuffle mixes regimes; isotonic dominates because
+    # the staircase distortion is large and the calibrated half is
+    # only mildly affected by isotonic overfitting on the inner-val.
+    cal_rand = Calibrator(CalibratorConfig(method="auto")).fit(raw, lab)
+    assert cal_rand.chosen_method != "identity"
+
+
+def test_inner_val_indices_validates_range():
+    raw, labels = _biased_synthetic(n=200)
+    cal = Calibrator(CalibratorConfig(method="auto"))
+    with pytest.raises(ValueError, match="out of range"):
+        cal.fit(raw, labels, inner_val_indices=np.array([0, 1, 250]))
+
+
+def test_inner_val_indices_rejects_duplicates():
+    raw, labels = _biased_synthetic(n=200)
+    cal = Calibrator(CalibratorConfig(method="auto"))
+    with pytest.raises(ValueError, match="duplicates"):
+        cal.fit(raw, labels, inner_val_indices=np.array([0, 1, 1, 2]))
+
+
+def test_inner_val_indices_rejects_empty():
+    raw, labels = _biased_synthetic(n=200)
+    cal = Calibrator(CalibratorConfig(method="auto"))
+    with pytest.raises(ValueError, match="non-empty"):
+        cal.fit(raw, labels, inner_val_indices=np.array([], dtype=int))
+
+
+def test_inner_val_indices_ignored_for_non_auto_method():
+    """Pass-through with a warning; fit must still complete cleanly."""
+    raw, labels = _biased_synthetic(n=400)
+    cal = Calibrator(CalibratorConfig(method="platt"))
+    cal.fit(raw, labels, inner_val_indices=np.array([0, 1, 2, 3]))
+    assert cal.chosen_method == "platt"
+    # No inner-val metrics for non-auto.
+    assert cal.inner_val_metrics is None
+
+
+# ── Brier co-criterion in skip guard (ADR-038 refined) ────────────────────
+
+
+def test_inner_val_metrics_records_brier_alongside_ece():
+    """Inner-val metrics dict carries Brier for all three candidates,
+    so the skip guard's strictly-proper co-criterion is auditable."""
+    raw, labels = _biased_synthetic(n=4000)
+    cal = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
+    iv = cal.inner_val_metrics
+    assert iv is not None
+    for method in ("platt", "isotonic", "identity"):
+        assert "ece" in iv[method]
+        assert "brier" in iv[method]
+        assert 0.0 <= iv[method]["brier"] <= 1.0
+
+
+def test_brier_co_criterion_can_block_calibration_when_only_ece_improves():
+    """Construct a stream where Platt/isotonic give a small ECE win
+    over raw but no Brier improvement — the skip guard should fire on
+    the Brier leg even though the ECE leg passes.
+
+    Setup: raw scores are uniform [0, 1] and labels are Bernoulli with
+    p = raw (already well-calibrated). Calibrators that fit on this
+    will, on inner-val, sometimes shave ECE through bin redistribution
+    but won't beat raw on Brier.
+    """
+    rng = np.random.default_rng(42)
+    n = 5000
+    raw = rng.uniform(0.05, 0.6, n)
+    labels = (rng.uniform(0, 1, n) < raw).astype(int)
+    cal = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
+    # On already-calibrated streams the Brier guard wins decisively —
+    # iso/Platt cannot strictly improve Brier over raw.
+    assert cal.chosen_method == "identity"
+    iv = cal.inner_val_metrics
+    assert iv is not None
+    # Sanity: identity Brier ≤ both calibrator Briers + brier_skip_delta —
+    # confirming the Brier leg of the guard correctly fired.
+    raw_brier = iv["identity"]["brier"]
+    assert iv["isotonic"]["brier"] + cal.config.brier_skip_delta >= raw_brier
+    assert iv["platt"]["brier"] + cal.config.brier_skip_delta >= raw_brier
+
+
+def test_brier_co_criterion_lets_genuine_improvement_through():
+    """On a clearly-distorted (staircase) stream, isotonic improves BOTH
+    ECE and Brier comfortably — neither leg of the skip guard fires."""
+    rng = np.random.default_rng(13)
+    n = 3000
+    raw = rng.uniform(0, 1, n)
+    true_p = np.where(raw < 0.33, 0.1, np.where(raw < 0.66, 0.5, 0.9))
+    labels = (rng.uniform(0, 1, n) < true_p).astype(int)
+    cal = Calibrator(CalibratorConfig(method="auto")).fit(raw, labels)
+    assert cal.chosen_method == "isotonic"
+    iv = cal.inner_val_metrics
+    assert iv is not None
+    # Sanity: on this synthetic isotonic genuinely beats raw on Brier.
+    assert iv["isotonic"]["brier"] + cal.config.brier_skip_delta < iv["identity"]["brier"]
+
+
+def test_brier_skip_delta_zero_disables_brier_leg():
+    """With brier_skip_delta=0 (and skip_threshold_delta=0), the skip
+    guard reverts to a pure 'strictly better than raw' check. Calibration
+    applies even on already-calibrated streams whenever it eke out any
+    micro-improvement on either metric.
+
+    NOTE: this is a knob for diagnostics, not a recommended setting —
+    the default brier_skip_delta=1e-4 is what makes the guard robust.
+    """
+    rng = np.random.default_rng(42)
+    n = 5000
+    raw = rng.uniform(0.05, 0.6, n)
+    labels = (rng.uniform(0, 1, n) < raw).astype(int)
+    cal = Calibrator(
+        CalibratorConfig(
+            method="auto",
+            skip_threshold_delta=-1.0,
+            brier_skip_delta=-1.0,
+        )
+    ).fit(raw, labels)
+    # With both legs disabled, skip can never fire — chosen is platt or iso.
+    assert cal.chosen_method in ("platt", "isotonic")
 
 
 # ── Calibrator: predict_softmax ───────────────────────────────────────────

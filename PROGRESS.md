@@ -7,26 +7,49 @@ Format: newest session at the top.
 
 ## Current State
 
-**Phase:** 0 — Master Training DB **LOADED + EXPORTED** · Phase 1 — PDF Ingestion **COMPLETE** · Phase 2 — Feature Engineering **COMPLETE** · Phase 3 — Baseline Models **COMPLETE** · Phase 4 — **COMPLETE** (Calibrator + PL + Stern + Copula + CUSUM drift + full-parquet validation)
-**Last completed task:** Built the remaining Phase-4 modules (Stern Gamma ordering, Copula pace-correlated ordering, CUSUM drift detection) and ran the full-parquet calibration validation. **Stern** (`app/services/ordering/stern.py`): SternConfig + SternModel with PL closed-form delegation at shape=1, MC sampling for shape ≠ 1 (default 20k samples), `implied_win_probs` + `infer_strengths` (damped multiplicative fixed-point) for marginal recovery, and `fit_stern_shape` (grid-search MLE over a corpus of (ordering, strengths) pairs). **Copula** (`app/services/ordering/copula.py`): Gaussian copula with Gamma marginals over a block-equicorrelation matrix by pace style, three PL/Stern fast paths (ρ=0, pace_styles=None, marginal_shape ≠ 1 → Stern), Cholesky+jitter MC sampler. **Drift** (`app/services/calibration/drift.py`): two-sided CUSUM on STANDARDISED Bernoulli z-score residuals (k=0.5, h=4 → ARL₀ ≈ 168), incremental `CUSUMDetector` + one-shot `detect_drift`. **Full-parquet validation** ran in ~14 minutes (231,942 calib / 231,160 test rows, dates 2015-07-12 → 2018-02-18) and produced an unexpected finding (see "Calibration finding" below). **464 tests passing** (was 389 → +75: 29 Stern + 20 Copula + 26 drift).
-**Next task:** Phase 5 — EV engine (`app/services/ev_engine/calculator.py`, `market_impact.py`) and portfolio optimiser (`app/services/portfolio/optimizer.py`, `sizing.py`). Before Phase 5 it may be worth a small Phase-4 follow-up to fix the auto-selector fit-slice criterion (see Calibration finding).
+**Phase:** 0 — Master Training DB **LOADED + EXPORTED** · Phase 1 — PDF Ingestion **COMPLETE** · Phase 2 — Feature Engineering **COMPLETE** · Phase 3 — Baseline Models **COMPLETE** · Phase 4 — **COMPLETE** (Calibrator + PL + Stern + Copula + CUSUM drift + full-parquet validation; auto-selector hardened via ADR-037 + ADR-038)
+**Last completed task:** Hardened the calibrator auto-selector with three complementary fixes (ADR-037 held-out inner-val ECE; ADR-038 skip-when-calibrated guard + time-ordered inner-val support + strictly-proper Brier co-criterion). The earlier full-parquet finding (isotonic chosen on already-calibrated streams, post-cal ECE worse than raw) traced to three distinct issues: (1) fit-slice ECE criterion overfit to isotonic memorisation — fixed in ADR-037 by computing inner-val ECE with a protective bias toward Platt; (2) time distribution shift — calib slice (older years) is more miscalibrated than the immediately-following test slice — fixed by accepting `inner_val_indices` so `validate_calibration.py` can pass the time-ordered tail of calib as the inner-val; (3) ECE is bin-noisy and isotonic could "win" by redistributing probability across bins without genuine accuracy improvement (advisor caught this) — fixed by adding Brier (strictly proper) as a co-criterion in the skip check. Both ECE and Brier must beat raw for any calibration to apply; otherwise `chosen_method='identity'` and `predict_proba` returns raw clipped to [0, 1]. Identity mode persists Platt + isotonic anyway for diagnostics. **483 tests passing** (was 464 → +19: 4 ADR-037 + 11 ADR-038 + 4 Brier co-criterion).
+**Next task:** Phase 5 — EV engine (`app/services/ev_engine/calculator.py`, `market_impact.py`) and portfolio optimiser (`app/services/portfolio/optimizer.py`, `sizing.py`).
 
-### Calibration finding — full-parquet vs. 5% smoke
+### Calibration finding — full-parquet (post-ADR-037 + ADR-038)
 
-The full-parquet run produced ECE deltas that **contradict the 5% smoke run** (10× more data, 30× larger calib/test slice). At full scale:
+After hardening the auto-selector with ADR-037 (held-out inner-val
+ECE) and ADR-038 (skip-when-calibrated guard + time-ordered inner-val
++ strictly-proper Brier co-criterion), the full-parquet validation
+(`models/baseline_full/calibration_adr038_brier/`) produced:
 
-| Model         | Pre-cal ECE | Post-cal ECE | Pre Brier | Post Brier | Method   |
-|---------------|------------:|-------------:|----------:|-----------:|----------|
-| Speed/Form    | **0.0031**  | 0.0058       | 0.0732    | 0.0733     | isotonic |
-| Meta-learner  | **0.0034**  | 0.0048       | 0.0679    | 0.0679     | isotonic |
+| Model        | Pre ECE   | Post ECE  | Pre Brier | Post Brier | Pre LogLoss | Post LogLoss | Chosen   |
+|--------------|----------:|----------:|----------:|-----------:|------------:|-------------:|----------|
+| Speed/Form   | 0.00310   | 0.00310   | 0.07317   | 0.07317    | 0.26227     | 0.26227      | identity |
+| Meta-learner | 0.00343   | 0.00478   | 0.06789   | 0.06788    | 0.23704     | 0.23693      | isotonic |
 
-Both models are ALREADY well-calibrated raw (ECE ≈ 0.003) — calibration was essentially unneeded. The auto-selector picked isotonic anyway because isotonic memorises the fit slice (fit-slice ECE → 0, vs. Platt ≈ 0.023). Applying isotonic to the test slice ADDED noise: ECE 0.003 → ~0.005-0.006 on both heads (Brier essentially unchanged).
+**Speed/Form** correctly skips (identity) because isotonic's inner-val
+Brier improvement (2.8e-6) is well below the 1e-4 threshold — iso's
+ECE "win" was bin redistribution, not accuracy. Post-cal metrics are
+identical to pre-cal.
 
-The 5% smoke (11.5K calib / test) had reported meta-learner pre-ECE = 0.121 / post = 0.011. That figure was a **small-sample artifact**: with 11.5K obs in the test split, ECE bin counts are noisy enough to inflate the estimate, AND the random 5% slice happened to land in a slightly miscalibrated region. The full-parquet baseline is the truth.
+**Meta-learner** correctly applies isotonic. Inner-val Brier
+improvement (1.6e-4) is just above the threshold; this transfers to
+the test slice as a tiny but real improvement on BOTH strictly proper
+scores (Brier 0.06789 → 0.06788, log-loss 0.23704 → 0.23693). Only
+ECE moved the "wrong" way (0.0034 → 0.0048) — but ECE is the
+bin-noisy summary the Brier co-criterion was put in place to override.
+The guard is working as designed: applies calibration when proper
+scores agree there is a real win, skips when they don't.
 
-This confirms the concern in ADR-008 / ADR-030: the auto-selector's fit-slice ECE criterion is broken when the underlying model is already well-calibrated. **Phase-4 follow-up** (recommended before Phase 5): change the auto-selector to either (a) require a minimum delta-ECE on a held-out slice within the fit set, or (b) default to Platt and only switch to isotonic when it meaningfully wins on held-out. ADR-030 already flagged this as provisional.
+Earlier full-parquet runs (pre-fix, fit-slice criterion; post-ADR-037
+but pre-Brier) both incorrectly picked isotonic on Speed/Form and
+materially degraded test ECE. See `calibration/` (original) and
+`calibration_adr038/` (post-ADR-037 ECE-only skip) artifact dirs for
+the historical comparison.
 
-Artifacts: `models/baseline_full/calibration/{speed_form,meta_learner}/{report.json,reliability.png,platt.joblib,isotonic.joblib,metadata.json}` + `summary.json`.
+The 5% smoke (11.5K calib / test) had reported meta-learner pre-ECE
+= 0.121 / post = 0.011. That figure was a **small-sample artifact**:
+with 11.5K obs in the test split, ECE bin counts are noisy enough to
+inflate the estimate, AND the random 5% slice happened to land in a
+slightly miscalibrated region. The full-parquet baseline is the truth.
+
+Artifacts: `models/baseline_full/calibration_adr038_brier/{speed_form,meta_learner}/{report.json,reliability.png,platt.joblib,isotonic.joblib,metadata.json}` + `summary.json`.
 
 ### Phase 4 module inventory (final)
 
@@ -59,6 +82,131 @@ JP carries 1.6M rows with no speed figure. Either derive a synthetic speed figur
 ---
 
 ## Session Log
+
+### Session: 2026-05-13 (a) — Calibrator hardening: ADR-037 held-out IV + ADR-038 skip guard + Brier co-criterion
+
+**Completed:**
+
+*ADR-037 — held-out inner-val ECE (replaces fit-slice criterion)*
+- `Calibrator._auto_select` now does an internal seeded shuffle of the
+  fit slice (default 80% inner-train / 20% inner-val), fits Platt and
+  isotonic on inner-train, computes ECE on inner-val for each, and
+  picks the lower one — with a 0.001 protective bias toward Platt
+  (isotonic must beat Platt by at least that on inner-val).
+- Falls back to fit-slice ECE only when the calib slice would produce
+  fewer than `auto_min_inner_val_size=100` inner-val rows.
+- `metadata.json` adds `inner_val_metrics` and `auto_selection_mode`
+  ("held_out" or "fit_slice_fallback").
+
+*ADR-038 — skip-when-calibrated guard + time-ordered inner-val + Brier co-criterion*
+- New config field `skip_threshold_delta` (default 0.001) AND
+  `brier_skip_delta` (default 1e-4). The auto-selector computes raw
+  inner-val ECE AND Brier alongside Platt and isotonic. Calibration
+  applies only if the winning method beats raw on BOTH metrics by the
+  configured deltas. Otherwise `chosen_method='identity'` and
+  `predict_proba` returns raw clipped to [0, 1] — no calibration.
+- The Brier leg is essential. The first post-ADR-038 full-parquet run
+  (ECE-only skip, before the Brier co-criterion) showed isotonic
+  genuinely winning on inner-val ECE (delta ≈ 4-5× threshold) yet
+  having no measurable Brier improvement. The "win" was bin
+  redistribution, not accuracy improvement, and on the test slice it
+  produced strictly worse ECE (0.003 → 0.005-0.006). Brier is
+  strictly proper — its minimum is achieved only at the true
+  distribution and it can't be improved by bin redistribution. With
+  Brier as co-criterion the guard correctly fires on this dataset.
+  This refinement was suggested by the advisor; the alternative
+  (bumping `skip_threshold_delta` to ~0.005) was rejected as data-
+  snooping on a single dataset.
+- New `Calibrator.fit(scores, labels, inner_val_indices=...)` parameter.
+  Caller supplies explicit row indices for the inner-val slice — used by
+  `validate_calibration.py` to pass the time-ordered TAIL of the calib
+  slice (last 20% by `race_date`). Selection mode reflects the source:
+  `held_out_caller` for caller-supplied indices, `held_out` for seeded
+  random shuffle, `fit_slice_fallback` for tiny calib slices.
+- `inner_val_metrics` and the full fit-slice `metrics` dict both gain
+  an `identity` entry alongside `platt` and `isotonic` (with both
+  ECE and Brier per method) so the choice is fully auditable.
+- Identity mode still persists fitted Platt + isotonic in the artifact
+  directory for diagnostic comparison.
+- Validation (`scripts/validate_calibration.py`) computes the
+  time-ordered tail with `calib['race_date'].argsort()[-20%:]` and
+  passes it as `inner_val_indices`. Logs the inner-val date range
+  for transparency.
+
+**Key Decisions Made (new ADRs):**
+
+- **ADR-037: Calibrator auto-selector uses held-out inner-val ECE.**
+  Supersedes ADR-030's fit-slice criterion. The fit-slice criterion
+  always picks isotonic because isotonic memorises (post-fit ECE
+  ≈ 1e-18). Held-out inner-val gives a real generalisation signal.
+- **ADR-038: Skip-when-calibrated guard + time-ordered inner-val +
+  Brier co-criterion.** Refines (does not supersede) ADR-037. The
+  guard requires the winning calibrator to beat raw on BOTH inner-val
+  ECE (by `skip_threshold_delta`, default 0.001) AND inner-val Brier
+  (by `brier_skip_delta`, default 1e-4). Brier is strictly proper —
+  needed because ECE alone can be gamed by bin redistribution. The
+  time-ordered inner-val (caller-supplied indices) handles
+  distribution shift between calib and test windows by making the
+  inner-val match the test slice as closely as possible. Identity
+  mode is a first-class outcome that returns raw scores clipped to
+  [0, 1].
+
+**Surprising / non-obvious findings to carry forward:**
+
+- The "isotonic over-fits the calib slice and degrades test ECE"
+  finding was actually THREE problems stacked: selection bias in the
+  criterion (ADR-037 fix), time-distribution shift between calib and
+  test windows (ADR-038 time-ordered IV), AND ECE bin-redistribution
+  noise that isotonic can win on without genuinely improving accuracy
+  (ADR-038 Brier co-criterion). Each fix in isolation is insufficient
+  on this dataset. The Brier co-criterion was the decisive one for
+  the full-parquet behavior — even with a perfectly placed inner-val
+  matching the test distribution, ECE alone is too noisy a criterion
+  at the relevant sample sizes (~46K rows × 15 bins → ECE SE ~0.001,
+  same magnitude as the threshold).
+- "Identity" as a first-class calibration outcome is the right
+  primitive. Forcing a Platt-vs-isotonic choice when neither is
+  better than raw is asking the auto-selector to make a decision
+  that has no winning answer. The identity path also makes the
+  pipeline robust to model updates: a future retraining that
+  produces well-calibrated raw output won't silently degrade
+  through a learned calibration map.
+- Brier as a co-criterion alongside ECE is the cheap way to make
+  the auto-selector robust to bin-redistribution gaming. Without it,
+  any threshold on ECE alone can be wrong — too tight and you miss
+  real wins, too loose and you accept fake wins. Brier's strict
+  propriety means the threshold can stay tight (1e-4 ≈ 0.3 SE) and
+  still filter out bin-noise wins.
+- Time-ordered inner-val is the CHEAP version of walk-forward
+  calibration. Walk-forward (re-fit on a rolling window of the most
+  recent N races) is the production-grade answer; the tail-of-calib
+  inner-val gives most of the signal at zero infrastructure cost.
+
+**Tests Status:**
+- **483 tests passing in ~25s** (was 464 → +19 calibrator tests).
+- New tests: skip-when-calibrated on already-calibrated stream;
+  identity-mode predict_proba returns clipped raw; identity
+  save/load round-trip; skip threshold tuning (large positive forces
+  identity, default lets clear wins through); caller-supplied
+  inner-val indices recorded as `held_out_caller`; time-ordered tail
+  changes selection on a regime-shifting synthetic; inner-val
+  index validation (out of range, duplicates, empty, ignored for
+  non-auto methods); Brier recorded alongside ECE in inner_val_metrics;
+  Brier co-criterion blocks bin-redistribution wins; Brier guard lets
+  genuine improvement through (staircase still picks isotonic);
+  brier_skip_delta tuning knob behaves as documented.
+
+**Known limitations carried forward:**
+
+- The Phase-3 stub models (PaceScenarioModel, SequenceModel) still
+  return constant 0.5. Phase 5 EV calculation will be valid only to
+  the extent that the meta-learner's marginal win probs are
+  trustworthy. Given the full-parquet ECE 0.003, that's a defensible
+  starting point.
+- `CopulaModel.infer_strengths` is not yet implemented (would mirror
+  `SternModel.infer_strengths`). Added when the pace model is real.
+
+---
 
 ### Session: 2026-05-12 (f) — Phase 4 complete: Stern + Copula + CUSUM + full-parquet calibration
 

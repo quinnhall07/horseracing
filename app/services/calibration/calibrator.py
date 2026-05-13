@@ -186,6 +186,26 @@ class CalibratorConfig:
     be chosen by `method='auto'`. Default 0.001 (= 0.1% ECE) introduces
     a small protective bias toward the simpler model when the two are
     statistically tied. Set to 0 to choose strictly by lower ECE."""
+    skip_threshold_delta: float = 0.001
+    """Skip-when-calibrated ECE threshold (ADR-038). The auto-selector
+    measures the raw scores' inner-val ECE. The winning calibrator must
+    beat raw inner-val ECE by at least this margin OR else identity
+    wins on the ECE leg of the skip check. ECE alone is bin-noisy at
+    moderate sample sizes — `brier_skip_delta` adds a strictly proper
+    co-criterion so the skip check can't be gamed by bin redistribution.
+    Both must show improvement to apply calibration. Set to 0 to disable
+    the ECE leg. Only applied in `method='auto'`."""
+    brier_skip_delta: float = 1e-4
+    """Skip-when-calibrated Brier threshold (ADR-038, refined). Brier
+    score is a STRICTLY PROPER scoring rule — its minimum is achieved
+    only at the true distribution and it can't be improved by bin
+    redistribution. Calibration only applies if the winning calibrator
+    beats raw inner-val Brier by at least this margin (in addition to
+    beating ECE by `skip_threshold_delta`). Default 1e-4 is intentionally
+    permissive (~ 0.3× the Brier SE at 50k inner-val rows) so it
+    doesn't fight against ECE in the borderline regime — it only catches
+    cases where iso/Platt's apparent ECE win is bin-redistribution
+    noise (Brier ≈ raw Brier). Set to 0 to disable the Brier leg."""
 
 
 @dataclass
@@ -220,11 +240,30 @@ class Calibrator:
         self.chosen_method: Optional[str] = None
         self.metrics: Optional[dict[str, dict]] = None
         self.inner_val_metrics: Optional[dict[str, dict]] = None
-        self.auto_selection_mode: Optional[str] = None  # "held_out" | "fit_slice_fallback" | None
+        self.auto_selection_mode: Optional[str] = None
+        # auto_selection_mode ∈ {"held_out", "held_out_caller",
+        #                        "fit_slice_fallback", None}
+        # chosen_method ∈ {"platt", "isotonic", "identity"} after fit;
+        # "identity" only reachable via method='auto' with the skip guard.
 
     # ── Fit ───────────────────────────────────────────────────────────────
 
-    def fit(self, scores: np.ndarray, labels: np.ndarray) -> "Calibrator":
+    def fit(
+        self,
+        scores: np.ndarray,
+        labels: np.ndarray,
+        inner_val_indices: Optional[np.ndarray] = None,
+    ) -> "Calibrator":
+        """Fit the calibrator on `scores` (raw model output in [0, 1]) and
+        binary `labels`.
+
+        `inner_val_indices` (optional, used only when `method='auto'`):
+            explicit row indices into (scores, labels) to hold out as the
+            inner-val slice for method selection. Pass a time-ordered tail
+            (e.g. last 20% of the calib slice by date) when the calib and
+            test slices are not interchangeable in time. When None, an
+            internal seeded random shuffle is used.
+        """
         if self.config.method not in _VALID_METHODS:
             raise ValueError(
                 f"Calibrator.method must be one of {_VALID_METHODS}; "
@@ -236,11 +275,19 @@ class Calibrator:
 
         method = self.config.method
         if method == "auto":
-            chosen, inner_val_metrics, sel_mode = self._auto_select(scores, labels)
+            chosen, inner_val_metrics, sel_mode = self._auto_select(
+                scores, labels, inner_val_indices=inner_val_indices,
+            )
             self.chosen_method = chosen
             self.inner_val_metrics = inner_val_metrics
             self.auto_selection_mode = sel_mode
         else:
+            if inner_val_indices is not None:
+                log.warning(
+                    "calibrator.inner_val_indices_ignored",
+                    reason="inner_val_indices is only meaningful for method='auto'",
+                    method=method,
+                )
             self.chosen_method = method
             self.inner_val_metrics = None
             self.auto_selection_mode = None
@@ -248,7 +295,10 @@ class Calibrator:
         # Always (re-)fit on the FULL fit slice so no data is wasted, AND
         # so the metrics dict can report fit-slice ECE/Brier for both
         # candidate methods (useful for diagnostics / comparison with the
-        # inner-val choice).
+        # inner-val choice). We fit Platt/iso even when chosen='identity'
+        # so the fit-slice metrics dict still contains both candidates'
+        # ECE for diagnostic purposes — predict_proba ignores them in
+        # identity mode.
         if method in ("platt", "auto"):
             self._platt = _fit_platt(scores, labels, seed=self.config.seed)
         if method in ("isotonic", "auto"):
@@ -274,6 +324,16 @@ class Calibrator:
                 brier=brier_score(p, labels),
                 n_samples=len(scores),
             ).asdict()
+        # Identity always quotable on the full fit slice for comparison.
+        if method == "auto":
+            p_id = np.clip(scores, 0.0, 1.0)
+            metrics["identity"] = CalibratorMetrics(
+                ece=expected_calibration_error(
+                    p_id, labels, n_bins=self.config.n_bins_for_selection
+                ),
+                brier=brier_score(p_id, labels),
+                n_samples=len(scores),
+            ).asdict()
 
         self.metrics = metrics
         log.info(
@@ -288,56 +348,109 @@ class Calibrator:
         return self
 
     def _auto_select(
-        self, scores: np.ndarray, labels: np.ndarray,
+        self,
+        scores: np.ndarray,
+        labels: np.ndarray,
+        inner_val_indices: Optional[np.ndarray] = None,
     ) -> tuple[str, dict, str]:
-        """Pick platt vs isotonic by held-out inner-val ECE.
+        """Pick platt vs isotonic vs identity by held-out inner-val ECE.
 
         Returns (chosen_method, inner_val_metrics_dict, selection_mode).
-        selection_mode is "held_out" when an inner split was used,
-        "fit_slice_fallback" when the fit slice was too small.
+        selection_mode ∈ {"held_out", "held_out_caller", "fit_slice_fallback"}.
+            * "held_out_caller" — caller supplied `inner_val_indices`.
+            * "held_out" — internal seeded random split.
+            * "fit_slice_fallback" — fit slice too small for any inner split.
+
+        chosen_method may be "identity" if the skip-when-calibrated guard
+        fires (best-of-{platt, isotonic} inner-val ECE doesn't beat raw
+        inner-val ECE by `skip_threshold_delta`).
         """
         n = len(scores)
-        n_val = int(n * self.config.auto_val_fraction)
 
-        # Fall back to fit-slice ECE for very small calib slices — inner-val
-        # ECE on < min_inner_val_size rows is too noisy to trust.
-        if n_val < self.config.auto_min_inner_val_size:
+        # ── Fit-slice fallback (calib too small for any inner split) ────
+        n_val_default = int(n * self.config.auto_val_fraction)
+        if (
+            inner_val_indices is None
+            and n_val_default < self.config.auto_min_inner_val_size
+        ):
             log.warning(
                 "calibrator.auto_using_fit_slice_fallback",
-                n=n, n_val=n_val,
+                n=n, n_val=n_val_default,
                 min_inner_val_size=self.config.auto_min_inner_val_size,
             )
             platt = _fit_platt(scores, labels, seed=self.config.seed)
             iso = _fit_isotonic(scores, labels)
-            platt_ece = expected_calibration_error(
-                _predict_platt(platt, scores), labels,
-                n_bins=self.config.n_bins_for_selection,
-            )
-            iso_ece = expected_calibration_error(
-                _predict_isotonic(iso, scores), labels,
-                n_bins=self.config.n_bins_for_selection,
-            )
-            chosen = (
-                "isotonic" if iso_ece + self.config.auto_min_delta_ece < platt_ece
-                else "platt"
+            raw_p = np.clip(scores, 0.0, 1.0)
+            platt_p = _predict_platt(platt, scores)
+            iso_p = _predict_isotonic(iso, scores)
+            n_bins = self.config.n_bins_for_selection
+            platt_ece = expected_calibration_error(platt_p, labels, n_bins=n_bins)
+            iso_ece = expected_calibration_error(iso_p, labels, n_bins=n_bins)
+            raw_ece = expected_calibration_error(raw_p, labels, n_bins=n_bins)
+            platt_brier = brier_score(platt_p, labels)
+            iso_brier = brier_score(iso_p, labels)
+            raw_brier = brier_score(raw_p, labels)
+            chosen = self._choose_with_skip(
+                platt_ece, iso_ece, raw_ece,
+                platt_brier, iso_brier, raw_brier,
             )
             return (
                 chosen,
                 {
-                    "platt": {"ece": float(platt_ece), "n_val": int(n)},
-                    "isotonic": {"ece": float(iso_ece), "n_val": int(n)},
+                    "platt": {
+                        "ece": float(platt_ece), "brier": float(platt_brier),
+                        "n_val": int(n),
+                    },
+                    "isotonic": {
+                        "ece": float(iso_ece), "brier": float(iso_brier),
+                        "n_val": int(n),
+                    },
+                    "identity": {
+                        "ece": float(raw_ece), "brier": float(raw_brier),
+                        "n_val": int(n),
+                    },
                 },
                 "fit_slice_fallback",
             )
 
-        # Random seeded split inside the fit slice. Time-isolation is
-        # enforced at the OUTER split (the calib slice itself is a
-        # contiguous time window); inside the slice a random split is
-        # appropriate for choosing between two 1-D calibration maps.
-        rng = np.random.default_rng(self.config.seed)
-        perm = rng.permutation(n)
-        val_idx = perm[:n_val]
-        train_idx = perm[n_val:]
+        # ── Resolve inner-val and inner-train indices ───────────────────
+        if inner_val_indices is not None:
+            val_idx = np.asarray(inner_val_indices, dtype=int).ravel()
+            if val_idx.size == 0:
+                raise ValueError("inner_val_indices must be non-empty")
+            if val_idx.min() < 0 or val_idx.max() >= n:
+                raise ValueError(
+                    f"inner_val_indices out of range [0, {n}); "
+                    f"got [{val_idx.min()}, {val_idx.max()}]"
+                )
+            if len(np.unique(val_idx)) != len(val_idx):
+                raise ValueError("inner_val_indices contains duplicates")
+            mask = np.ones(n, dtype=bool)
+            mask[val_idx] = False
+            train_idx = np.flatnonzero(mask)
+            sel_mode = "held_out_caller"
+            if (
+                len(val_idx) < self.config.auto_min_inner_val_size
+                or len(train_idx) < self.config.auto_min_inner_val_size
+            ):
+                log.warning(
+                    "calibrator.caller_inner_val_below_minimum",
+                    n_val=len(val_idx), n_train=len(train_idx),
+                    min_inner_val_size=self.config.auto_min_inner_val_size,
+                )
+        else:
+            # Random seeded split inside the fit slice. Time-isolation is
+            # enforced at the OUTER split (the calib slice is a
+            # contiguous time window); inside the slice a random split
+            # is appropriate when distribution is roughly stationary
+            # within the calib window. Pass `inner_val_indices` for
+            # explicit time-ordered support — recommended when the
+            # underlying score distribution drifts over time.
+            rng = np.random.default_rng(self.config.seed)
+            perm = rng.permutation(n)
+            val_idx = perm[:n_val_default]
+            train_idx = perm[n_val_default:]
+            sel_mode = "held_out"
 
         s_tr, l_tr = scores[train_idx], labels[train_idx]
         s_val, l_val = scores[val_idx], labels[val_idx]
@@ -345,28 +458,75 @@ class Calibrator:
         platt_inner = _fit_platt(s_tr, l_tr, seed=self.config.seed)
         iso_inner = _fit_isotonic(s_tr, l_tr)
 
-        platt_ece = expected_calibration_error(
-            _predict_platt(platt_inner, s_val), l_val,
-            n_bins=self.config.n_bins_for_selection,
-        )
-        iso_ece = expected_calibration_error(
-            _predict_isotonic(iso_inner, s_val), l_val,
-            n_bins=self.config.n_bins_for_selection,
-        )
-        # Isotonic wins only if it beats Platt by min_delta_ece on inner-val.
-        # Default min_delta=0.001 protects against noise-driven swaps.
-        chosen = (
-            "isotonic" if iso_ece + self.config.auto_min_delta_ece < platt_ece
-            else "platt"
+        platt_p = _predict_platt(platt_inner, s_val)
+        iso_p = _predict_isotonic(iso_inner, s_val)
+        raw_val = np.clip(s_val, 0.0, 1.0)
+
+        n_bins = self.config.n_bins_for_selection
+        platt_ece = expected_calibration_error(platt_p, l_val, n_bins=n_bins)
+        iso_ece = expected_calibration_error(iso_p, l_val, n_bins=n_bins)
+        raw_ece = expected_calibration_error(raw_val, l_val, n_bins=n_bins)
+
+        # Brier is strictly proper — co-criterion for the skip check so
+        # bin-redistribution noise can't game the ECE rule.
+        platt_brier = brier_score(platt_p, l_val)
+        iso_brier = brier_score(iso_p, l_val)
+        raw_brier = brier_score(raw_val, l_val)
+
+        chosen = self._choose_with_skip(
+            platt_ece, iso_ece, raw_ece,
+            platt_brier, iso_brier, raw_brier,
         )
         return (
             chosen,
             {
-                "platt": {"ece": float(platt_ece), "n_val": int(n_val)},
-                "isotonic": {"ece": float(iso_ece), "n_val": int(n_val)},
+                "platt": {
+                    "ece": float(platt_ece), "brier": float(platt_brier),
+                    "n_val": int(len(val_idx)),
+                },
+                "isotonic": {
+                    "ece": float(iso_ece), "brier": float(iso_brier),
+                    "n_val": int(len(val_idx)),
+                },
+                "identity": {
+                    "ece": float(raw_ece), "brier": float(raw_brier),
+                    "n_val": int(len(val_idx)),
+                },
             },
-            "held_out",
+            sel_mode,
         )
+
+    def _choose_with_skip(
+        self,
+        platt_ece: float,
+        iso_ece: float,
+        raw_ece: float,
+        platt_brier: float,
+        iso_brier: float,
+        raw_brier: float,
+    ) -> str:
+        """Apply both selection rules:
+            1. Isotonic vs Platt: isotonic wins iff iso_ece + min_delta < platt_ece.
+            2. Skip-when-calibrated: best-of-two must beat raw on BOTH
+               ECE (by skip_threshold_delta) AND Brier (by brier_skip_delta)
+               to apply any calibration. Brier is strictly proper, so a
+               method that genuinely improves predictions wins on both;
+               a method that only redistributes probability across bins
+               wins on ECE but ties on Brier — and is correctly rejected.
+        """
+        method_winner = (
+            "isotonic" if iso_ece + self.config.auto_min_delta_ece < platt_ece
+            else "platt"
+        )
+        winner_ece = iso_ece if method_winner == "isotonic" else platt_ece
+        winner_brier = iso_brier if method_winner == "isotonic" else platt_brier
+
+        ece_beats_raw = winner_ece + self.config.skip_threshold_delta < raw_ece
+        brier_beats_raw = winner_brier + self.config.brier_skip_delta < raw_brier
+
+        if ece_beats_raw and brier_beats_raw:
+            return method_winner
+        return "identity"
 
     # ── Predict ───────────────────────────────────────────────────────────
 
@@ -376,9 +536,15 @@ class Calibrator:
 
     def predict_proba(self, scores: np.ndarray) -> np.ndarray:
         """Calibrated per-row probabilities in [0, 1]. Output is NOT
-        per-race normalised — use `predict_softmax` for that."""
+        per-race normalised — use `predict_softmax` for that.
+
+        When `chosen_method == 'identity'` (skip-when-calibrated guard
+        fired in auto mode), returns raw scores clipped to [0, 1] —
+        applying calibration would have degraded the inner-val ECE."""
         self._ensure_fitted()
         scores = np.asarray(scores, dtype=float).ravel()
+        if self.chosen_method == "identity":
+            return np.clip(scores, 0.0, 1.0)
         if self.chosen_method == "platt":
             return _predict_platt(self._platt, scores)  # type: ignore[arg-type]
         return _predict_isotonic(self._isotonic, scores)  # type: ignore[arg-type]

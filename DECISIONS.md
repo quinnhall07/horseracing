@@ -1559,3 +1559,152 @@ we should investigate per-jurisdiction calibration.
   ~17k races, the IID-with-race assumption is already mild and the
   added complexity isn't worth it for an automated selection knob).
 
+## ADR-038: Skip-When-Calibrated Guard + Time-Ordered Inner-Val (Refines ADR-037)
+
+**Date:** 2026-05-13
+**Status:** Accepted (refines ADR-037 — does NOT supersede it).
+Refined the same day to add a strictly-proper Brier co-criterion to
+the skip check after the post-fix full-parquet run showed isotonic
+genuinely winning on inner-val ECE while only redistributing
+probability across bins (post-cal test ECE > pre-cal test ECE; test
+Brier essentially unchanged).
+
+**Context:**
+ADR-037 fixed the auto-selector's selection criterion (held-out
+inner-val ECE instead of fit-slice ECE), but the post-fix full-parquet
+run revealed two remaining problems:
+
+1. **Selection bias is fixed; degradation persists.** On the full
+   parquet, the held-out auto-selector correctly identifies isotonic
+   as the inner-val winner (delta ≈ 20× the min_delta_ece threshold).
+   But the chosen calibrator still degrades test-slice ECE from
+   ≈ 0.003 raw to ≈ 0.005-0.006 post-cal. Root cause: time-
+   distribution shift. The model improves over time, so the calib
+   slice (older years) is more miscalibrated than the test slice
+   (newer years). Calibration fitted on the older window adds noise
+   on the newer test data.
+
+2. **No way to skip calibration entirely.** When raw scores are
+   already well-calibrated probabilities (the meta-learner's output
+   on this dataset is one such case), ANY learned calibration map
+   adds variance without removing bias — the optimal calibration
+   map is the identity. The previous selector could only choose
+   between Platt and isotonic.
+
+**Decision:**
+Two complementary refinements to `Calibrator.fit` under `method='auto'`:
+
+1. **Skip-when-calibrated guard (`skip_threshold_delta`, default 0.001;
+   `brier_skip_delta`, default 1e-4):**
+   The auto-selector computes raw inner-val ECE AND Brier alongside
+   Platt and isotonic. Calibration applies only if the winning method
+   beats raw on BOTH metrics by the configured deltas. Otherwise
+   `chosen_method = 'identity'` and `predict_proba` returns raw
+   scores clipped to [0, 1].
+
+       method_winner = isotonic_or_platt_per_min_delta_rule
+       winner_ece, winner_brier = (iso or platt) per the above rule
+       ece_beats   = winner_ece   + skip_threshold_delta < raw_ece
+       brier_beats = winner_brier + brier_skip_delta     < raw_brier
+       chosen = method_winner if (ece_beats AND brier_beats) else 'identity'
+
+   The Brier co-criterion is essential: ECE is a binned summary that
+   noise can game by redistributing probability across bins (no real
+   accuracy improvement, but ECE drops). Brier is strictly proper —
+   its minimum is achieved only at the true distribution. Requiring
+   both rules out the case observed on the full parquet, where
+   isotonic genuinely won on inner-val ECE (delta ≈ 4× threshold)
+   yet had no measurable Brier improvement on either inner-val or
+   test, and produced strictly worse test ECE post-cal.
+
+2. **Time-ordered inner-val support (`inner_val_indices` parameter):**
+   `Calibrator.fit(scores, labels, inner_val_indices=...)` accepts
+   explicit row indices to use as the inner-val slice instead of an
+   internal seeded random shuffle. Callers should pass the
+   time-ordered TAIL of the calib slice (e.g. last 20% of calib by
+   `race_date`). The tail is the closest in-distribution proxy for
+   the test slice, which immediately follows the calib slice in
+   time. `validate_calibration.py` does this automatically.
+
+   Selection mode reflects the source: `held_out_caller` for
+   caller-supplied indices, `held_out` for seeded random shuffle,
+   `fit_slice_fallback` for tiny calib slices.
+
+Both calibrators are STILL re-fit on the full calib slice and metrics
+for both (plus identity) are persisted, so the selection is fully
+auditable. `metadata.json` adds an `identity` entry to both `metrics`
+and `inner_val_metrics`.
+
+**Rationale:**
+- The skip guard is the right answer when raw is already calibrated:
+  the optimal calibration map IS the identity, and learning a Platt
+  or isotonic map can only add variance. The 0.001 default threshold
+  matches `auto_min_delta_ece` — both express "the differences below
+  this aren't statistically meaningful at our sample sizes."
+- Time-ordered inner-val is the right answer when there's drift
+  between calib and test windows. Random shuffle inside the calib
+  slice gives an inner-val that looks like the calib slice; the tail
+  gives an inner-val that looks like the test slice. The latter is
+  what we actually need to predict generalisation.
+- Combining both is statistically sound: if a calibrator's apparent
+  win on the random-shuffle inner-val disappears on the time-ordered
+  inner-val (because that's where drift is visible), the skip guard
+  catches the case and falls back to identity. Either fix alone is
+  insufficient; together they are.
+- Identity mode persists Platt and isotonic anyway so the same
+  artifact directory can be re-loaded, inspected, and the choice
+  re-litigated against newer data without re-training.
+
+**Empirical Validation:**
+First full-parquet re-run (ECE-only skip) showed isotonic still chosen
+because iso beat raw on inner-val ECE by 4-5× threshold — but iso's
+inner-val Brier improvement was vanishingly small. Test slice
+confirmed: post-cal ECE 0.0058 / 0.0048 vs pre-cal 0.0031 / 0.0034
+(speed_form / meta), and Brier essentially unchanged. The "win" was
+mostly bin redistribution.
+
+Post-Brier-co-criterion full-parquet re-run (the shipped behavior):
+- `speed_form`: `chosen_method='identity'` — isotonic's Brier
+  improvement on inner-val was 2.8e-6 (≪ 1e-4 threshold), so skip
+  fires. Test pre-cal = post-cal exactly: ECE 0.0031, Brier 0.0732,
+  log-loss 0.2623. No degradation.
+- `meta_learner`: `chosen_method='isotonic'` — isotonic's inner-val
+  Brier beats identity by 1.6e-4 (just above the 1e-4 threshold).
+  This is a genuine (if small) accuracy improvement, and it transfers
+  to the test slice: post-cal Brier 0.06788 vs pre-cal 0.06789
+  (better by 1.6e-5), post-cal log-loss 0.23693 vs pre-cal 0.23704
+  (better by 1.1e-4). Both strictly proper scores improve. Test ECE
+  moved the "wrong" way (0.0034 → 0.0048) — but ECE is the binned
+  summary that the Brier co-criterion was put in place to override.
+  This is the guard working as designed: ECE alone said "apply
+  isotonic, big win"; the proper scores said "tiny but real win";
+  the guard correctly applied the tiny-but-real win and ignored
+  the bin-summary signal.
+
+The guard is therefore a PRECISION FILTER, not a blanket disable: it
+correctly applies calibration when proper scores agree there is a
+real win (meta_learner) and correctly skips when they don't
+(speed_form). On future datasets where isotonic genuinely improves
+both inner-val ECE AND inner-val Brier over raw by the configured
+thresholds, calibration SHOULD be applied.
+
+**Relationship to ADR-037:**
+ADR-037 stays in force — held-out inner-val is still the criterion
+for choosing BETWEEN Platt and isotonic. ADR-038 extends the choice
+set to include identity, and lets the caller control which rows
+constitute the inner-val.
+
+**Rejected Alternatives:**
+- Always force `method='identity'` for downstream models known to be
+  well-calibrated (e.g. meta-learner) — rejected. The whole point of
+  the auto-selector is that calibration need can change with data,
+  model retraining, and jurisdiction. A static rule misses the case
+  where the model becomes miscalibrated mid-season and needs a
+  Platt/isotonic correction.
+- Use the test slice itself as the inner-val (target leakage) —
+  obviously rejected.
+- Walk-forward calibration (re-fit calibrator on a rolling window of
+  the most recent N races) — deferred to Phase 5 / production. This
+  is the right answer for production but requires online infra.
+  ADR-038's tail-of-calib inner-val is the offline approximation.
+
