@@ -46,7 +46,7 @@ class BetCandidate(BaseModel):
     pool_size: Optional[Annotated[float, Field(ge=0.0)]] = None
 
     @model_validator(mode="after")
-    def _validate_selection(self) -> "BetCandidate":
+    def validate_selection(self) -> "BetCandidate":
         if self.bet_type not in _SUPPORTED_BET_TYPES_5A:
             raise ValueError(
                 f"bet_type {self.bet_type} not supported in Phase 5a "
@@ -67,7 +67,13 @@ class BetCandidate(BaseModel):
 
 
 class BetRecommendation(BaseModel):
-    """A bet selected by the portfolio optimiser for placement."""
+    """A bet selected by the portfolio optimiser for placement.
+
+    Callers (Phase 5b portfolio optimiser) are responsible for keeping
+    `stake` and `stake_fraction` consistent — the schema cannot enforce
+    `stake == stake_fraction * bankroll` because `bankroll` lives on
+    `Portfolio`, not on the recommendation.
+    """
 
     candidate: BetCandidate
     stake: Annotated[float, Field(ge=0.0)]

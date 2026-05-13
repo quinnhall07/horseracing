@@ -76,6 +76,10 @@ def test_pick_n_bet_types_rejected_in_5a():
     """Phase 5a does not support cross-race bets. ADR-039 defers Pick3/4/6."""
     with pytest.raises(ValueError, match="not supported"):
         _candidate(bet_type=BetType.PICK3, selection=(0, 1, 2))
+    with pytest.raises(ValueError, match="not supported"):
+        _candidate(bet_type=BetType.PICK4, selection=(0, 1, 2, 3))
+    with pytest.raises(ValueError, match="not supported"):
+        _candidate(bet_type=BetType.PICK6, selection=(0, 1, 2, 3, 4, 5))
 
 
 def test_place_and_show_rejected_in_5a():
