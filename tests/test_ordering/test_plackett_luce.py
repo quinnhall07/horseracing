@@ -330,3 +330,73 @@ def test_place_prob_certain_horse():
     # horse cannot place behind a horse that wins with probability 1.
     assert place_prob(p, 1) == pytest.approx(0.0)
     assert place_prob(p, 2) == pytest.approx(0.0)
+
+
+# ── sample_orderings_vectorised (Phase 5b) ────────────────────────────────
+
+
+def test_sample_orderings_vectorised_shape_and_dtype():
+    """Output is (n_samples, n_horses) int64."""
+    from app.services.ordering.plackett_luce import sample_orderings_vectorised
+
+    rng = np.random.default_rng(0)
+    s = np.array([0.4, 0.3, 0.2, 0.1])
+    out = sample_orderings_vectorised(s, n_samples=128, rng=rng)
+    assert out.shape == (128, 4)
+    assert out.dtype == np.int64
+
+
+def test_sample_orderings_vectorised_each_row_is_permutation():
+    """Each row must be a permutation of range(n_horses) — no duplicates,
+    no out-of-range indices."""
+    from app.services.ordering.plackett_luce import sample_orderings_vectorised
+
+    rng = np.random.default_rng(1)
+    s = np.array([0.5, 0.25, 0.15, 0.07, 0.03])
+    out = sample_orderings_vectorised(s, n_samples=64, rng=rng)
+    n = len(s)
+    for row in out:
+        assert sorted(row.tolist()) == list(range(n))
+
+
+def test_sample_orderings_vectorised_first_place_frequency_matches_strengths():
+    """Empirical Pr(horse i wins) → strengths[i] / sum(strengths) as n_samples
+    grows. We use n_samples=20000 and assert absolute error < 0.02 per horse."""
+    from app.services.ordering.plackett_luce import sample_orderings_vectorised
+
+    rng = np.random.default_rng(2026)
+    s = np.array([0.5, 0.3, 0.2])
+    expected = s / s.sum()
+    n_samples = 20000
+    out = sample_orderings_vectorised(s, n_samples=n_samples, rng=rng)
+    winners = out[:, 0]
+    emp = np.array([(winners == i).mean() for i in range(len(s))])
+    assert np.allclose(emp, expected, atol=0.02)
+
+
+def test_sample_orderings_vectorised_rejects_empty_strengths():
+    from app.services.ordering.plackett_luce import sample_orderings_vectorised
+
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="non-empty"):
+        sample_orderings_vectorised(np.array([]), n_samples=10, rng=rng)
+
+
+def test_sample_orderings_vectorised_rejects_nonpositive_strengths():
+    from app.services.ordering.plackett_luce import sample_orderings_vectorised
+
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="strictly positive"):
+        sample_orderings_vectorised(np.array([0.5, 0.0, 0.5]), n_samples=10, rng=rng)
+
+
+def test_sample_orderings_vectorised_seeded_determinism():
+    """Same seed + inputs ⇒ identical output."""
+    from app.services.ordering.plackett_luce import sample_orderings_vectorised
+
+    s = np.array([0.4, 0.3, 0.2, 0.1])
+    rng_a = np.random.default_rng(42)
+    rng_b = np.random.default_rng(42)
+    out_a = sample_orderings_vectorised(s, n_samples=32, rng=rng_a)
+    out_b = sample_orderings_vectorised(s, n_samples=32, rng=rng_b)
+    np.testing.assert_array_equal(out_a, out_b)

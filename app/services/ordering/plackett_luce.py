@@ -230,6 +230,50 @@ def sample_ordering(p: np.ndarray, rng: np.random.Generator) -> list[int]:
     return order
 
 
+def sample_orderings_vectorised(
+    strengths: np.ndarray,
+    n_samples: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Vectorised Plackett-Luce sampling via the Gumbel-trick.
+
+    Returns an (n_samples, n_horses) int64 array; each row is a finishing
+    order (positions 0..n-1, winner first). Used by the Phase 5b CVaR LP to
+    build the Monte Carlo payoff matrix in one pass without a python loop
+    over scenarios.
+
+    Why Gumbel-trick: argsort(log_s + Gumbel(0,1)) is distributed exactly
+    as a single PL sample over `strengths` (Yellott 1977 / Gumbel-Max).
+    Generating the entire (n_samples, n_horses) matrix via one numpy
+    uniform → log → log call and one argsort is dramatically faster than
+    calling `sample_ordering` in a python loop.
+
+    Args:
+        strengths: 1-d non-empty array of strictly-positive PL strengths.
+            Need not be normalised — the Gumbel-Max trick is invariant to a
+            multiplicative scale on s (a global additive shift in log_s
+            cancels through argsort).
+        n_samples: number of independent orderings to draw.
+        rng:       seeded numpy Generator for reproducibility.
+
+    Raises:
+        ValueError: on empty / multi-dimensional / non-positive strengths.
+    """
+    s = np.asarray(strengths, dtype=float)
+    if s.ndim != 1 or len(s) == 0:
+        raise ValueError("strengths must be a 1-d non-empty array")
+    if (s <= 0).any():
+        raise ValueError("strengths must be strictly positive")
+    log_s = np.log(s)
+    # Bound `u` away from 0 so −log(u) is finite. The upper exclusive bound
+    # of the half-open uniform on (low, high] is 1.0; log(1.0)=0 →
+    # −log(0)=inf is excluded by `low=1e-300 > 0`.
+    u = rng.uniform(low=1e-300, high=1.0, size=(n_samples, len(s)))
+    gumbel = -np.log(-np.log(u))
+    perturbed = log_s[None, :] + gumbel
+    return np.argsort(-perturbed, axis=1).astype(np.int64)
+
+
 # ── MLE strength estimation ───────────────────────────────────────────────
 
 
@@ -361,6 +405,7 @@ __all__ = [
     "fit_plackett_luce_mle",
     "place_prob",
     "sample_ordering",
+    "sample_orderings_vectorised",
     "show_prob",
     "superfecta_prob",
     "trifecta_prob",

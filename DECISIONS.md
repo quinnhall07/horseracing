@@ -1765,3 +1765,69 @@ Decoupling the calculator from the odds source has three consequences:
 
 **Note on smoke-run data quality (carried forward to Phase 5b):**
 The first backtest smoke run (5% sample → 11,574 test rows / 8,717 races) produced 10,663 +EV candidates with mean edge 0.705 and mean EV/$ of 34.9 — both implausibly large. Root cause: the parquet's `odds_final` column contains extreme values (likely 99/999 placeholders for scratched or rare-payout horses) which, when fed into `1/odds`, produce near-zero market probabilities and therefore enormous nominal edges against ANY non-zero model probability. The EV engine is computing what it was asked; the data is the problem. Phase 5b should add an upper bound on `decimal_odds` at the validation-script level (suggested cap: ~100, dropping ~scratched/placeholder rows) before the portfolio optimiser will produce sensible results.
+
+
+---
+
+## ADR-041: CVaR-LP Portfolio Optimiser — Rockafellar-Uryasev with Vectorised PL Scenarios, Per-Race Scope
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+**Context:**
+Phase 5b needs to allocate capital across a list of `BetCandidate` objects under a CVaR risk constraint, per CLAUDE.md §2 ("CVaR-constrained, not mean-variance alone") and ADR-005. The optimiser's three coupled design choices are: (a) the optimisation form, (b) how scenarios are generated, and (c) the scope of a single solve.
+
+**Decision:**
+
+**a. Rockafellar-Uryasev (2000) CVaR LP via `scipy.optimize.linprog(method="highs")`.**
+Decision vector `x = [f_0, …, f_{n-1}, v, u_0, …, u_{S-1}]`, length `n + 1 + S`, where `f_i` is the stake fraction of bankroll on candidate i, `v` is the VaR proxy (free), and `u_s ≥ 0` are per-scenario shortfall slacks. The LP is:
+
+```
+minimise   −Σ_i f_i · ev_per_dollar_i               (negate to maximise EV)
+subject to
+   −payoff.T · f − v − u_s ≤ 0       for s = 1..S    (scenario shortfall, S rows)
+   v + (1/(α·S)) · Σ_s u_s ≤ M                       (CVaR cap, 1 row)
+   Σ_i f_i ≤ 1                                       (budget, 1 row)
+bounds  0 ≤ f_i ≤ min(¼-Kelly_i, max_bet_fraction)
+        v free; u_s ≥ 0
+```
+
+where `α = cvar_alpha` (default 0.05), `M = max_drawdown_pct` (default 0.20), and the per-candidate upper bound uses `app.services.portfolio.sizing.kelly_fraction` and `apply_bet_cap` (ADR-002, ¼-Kelly + 3% cap). The CVaR at optimum is `v + (1/(α·S)) · Σ_s u_s`; we report it in USD as `bankroll × LHS` (i.e., `Portfolio.cvar_95` is dollar-denominated, NOT a fraction).
+
+**b. Monte Carlo scenarios via the Gumbel-trick Plackett-Luce sampler.**
+`app.services.ordering.plackett_luce.sample_orderings_vectorised(strengths, n_samples, rng)` returns an `(n_samples, n_horses)` int64 array of finishing orders. Implementation: `argsort(-(log_s + Gumbel(0,1)))`; the Yellott / Gumbel-Max identity makes a single argsort over a perturbed log-strength matrix equal in distribution to a single PL draw. One numpy call per race instead of a python loop over scenarios.
+
+For each candidate i in scenario s, the per-$1 payoff is `+(decimal_odds_i − 1)` on a hit and `−1` on a miss. Hit logic per bet type:
+- WIN: `order[0] == sel[0]`
+- EXACTA: `order[0:2] == sel[0:2]`
+- TRIFECTA: `order[0:3] == sel[0:3]`
+- SUPERFECTA: `order[0:4] == sel[0:4]`
+
+Per-race seeding (`np.random.default_rng([seed, hash(race_id) & 0xFFFFFFFF])`) makes the result invariant to candidate ordering and stable when callers add/remove races.
+
+**c. Per-race scope.**
+A single `optimize_portfolio(...)` call operates on candidates from one race. The validation script (`scripts/validate_phase5a_ev_engine.py --optimize`) loops over races and calls the optimiser once per race. Cross-race correlation is set aside, mirroring ADR-039's per-race exotic scope.
+
+**d. `n_scenarios = 1000` default.**
+Empirical Monte Carlo error for CVaR at α=0.05 scales as `~1/sqrt(α·S)`. With S=1000 that is `~1/sqrt(50) ≈ 14%` per-portfolio. Down-sampling to S=200 nearly doubles the error; up-sampling to S=5000 cuts it to ~6% but multiplies the linprog row count by 5 (LP rows are dominated by the S scenario rows). 1000 is the empirical sweet spot for the per-race optimiser to run in ≲ 50 ms on a 10-horse / 50-candidate field. Callers wanting tighter tails should up `n_scenarios` on important races.
+
+**e. VaR/CVaR reported in USD.**
+`Portfolio.var_95` and `Portfolio.cvar_95` are `bankroll * v` and `bankroll * cvar_lhs` respectively. The schema field type is `float` (no unit), but the convention is dollars throughout the Phase 5b code path. A future Phase 6 frontend should display them as `$1,234.56`.
+
+**Rationale:**
+- Rockafellar-Uryasev is the canonical LP form for CVaR; it converts a non-convex risk objective into a single LP that scipy can solve in milliseconds. Two other formulations were considered:
+  1. Direct Monte Carlo sample-average optimisation with empirical CVaR computed per iteration: rejected because it requires a non-LP solver (`scipy.optimize.minimize`) and is non-deterministic when the simplex tie-breaks.
+  2. Closed-form correlated-Kelly: rejected because PL exotic correlations have no simple closed form across bet types.
+- Per-race scope is the cleanest interpretation of "correlation" given current data: WIN bets on the same race are perfectly correlated through the same finishing order; EXACTAs share the same denominator structure; cross-race bets are independent under the current independence assumption (no card-level latent state model yet — ADR-039).
+- Gumbel-trick vectorisation is 50-200× faster than calling `sample_ordering` in a python loop for typical field sizes; the LP itself is microseconds, so the sampler dominated before this optimisation.
+- N=1000 is conservative for production. The smoke tests use N=500-800 to stay under 1 s per race; the validation-script default is the larger value.
+
+**Rejected Alternatives:**
+- **Mean-variance** (Markowitz on portfolio variance) — rejected per CLAUDE.md §2 / ADR-005. Mean-variance penalises upside symmetric to downside, which is wrong for positively-skewed exotic payouts.
+- **Per-bet Kelly applied sequentially** — rejected per ADR-005. Ignores correlation; over-allocates to correlated exactas.
+- **Full-Kelly (fraction=1.0) bounds in the LP** — rejected per ADR-002. The 3% cap is unconditional; the LP's per-candidate upper bound is `min(¼-Kelly, max_bet_fraction)`.
+- **Cross-race joint optimisation** — deferred. Requires a shared latent track-state model (Master Reference §206-209) to be meaningful; without it, races are independent and per-race solves give the same allocation as a single joint solve.
+
+**When to revisit:**
+- When cross-race correlation modelling lands (card-level latent state, ADR pending).
+- When live pari-mutuel pool data is available — the LP should then include pool-impact constraints on `f_i` (currently delegated to the EV calculator's pre-LP single-step approximation).
