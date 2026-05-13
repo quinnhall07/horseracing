@@ -15,14 +15,25 @@ Two estimators are implemented:
     * Isotonic regression — non-parametric piecewise-constant fit. Handles
       arbitrary monotone distortions but needs more data to be stable.
 
-The "auto" method fits both on an inner-train slice (default 80% of the
-fit data, seeded random shuffle), evaluates ECE on the held-out inner-val
-slice (default 20%), and keeps the one with lower inner-val ECE —
-isotonic must beat Platt by `auto_min_delta_ece` (default 0.001) to be
-chosen, giving a one-sided protective bias toward the simpler model.
-Both calibrators are then re-fit on the FULL fit data so no data is
-wasted. See ADR-037 — this corrects the fit-slice criterion in ADR-030
-that overfit to isotonic memorisation.
+Auto-selection (ADR-037, refined by ADR-038):
+    The `auto` method fits both Platt and isotonic on an inner-train slice
+    and evaluates ECE on a held-out inner-val slice. The inner split can
+    be either:
+        * Random seeded shuffle (default, when inner_val_indices=None).
+        * Caller-supplied indices (e.g. time-ordered tail of the calib
+          slice — recommended when the underlying score distribution
+          drifts over time, since the test slice immediately follows the
+          calib slice in time).
+    Isotonic must beat Platt by `auto_min_delta_ece` (default 0.001) to be
+    chosen — a small protective bias toward the simpler model.
+    A third "identity" outcome is possible: if neither Platt nor isotonic
+    beats the raw scores' inner-val ECE by `skip_threshold_delta` (default
+    0.001), the calibrator skips fitting and returns raw scores unchanged
+    via `predict_proba`. This guards against degrading already-calibrated
+    streams (e.g. meta-learner output that is near-perfect to begin with).
+    Both fitted calibrators are still re-fit on the FULL fit data so no
+    data is wasted, even when the chosen method is "identity" (kept for
+    diagnostic metrics).
 
 Per-race softmax (with optional temperature) renormalises the calibrated
 per-row probabilities so each race sums to 1.
@@ -32,6 +43,11 @@ API:
     p   = cal.predict_proba(raw)                       # per-row calibrated
     p   = cal.predict_softmax(raw, race_ids)           # per-race sum=1
     cal.save(path) / Calibrator.load(path)
+
+    # Time-ordered inner-val (recommended when calib/test windows differ):
+    sorted_idx = np.argsort(calib_dates)
+    iv_idx = sorted_idx[-int(0.2 * len(sorted_idx)):]
+    cal.fit(scores, labels, inner_val_indices=iv_idx)
 """
 
 from __future__ import annotations
