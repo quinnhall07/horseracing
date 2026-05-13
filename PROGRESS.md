@@ -7,9 +7,9 @@ Format: newest session at the top.
 
 ## Current State
 
-**Phase:** Phase 5a — EV Engine **COMPLETE** · Phase 5b — Portfolio Optimiser **NEXT**.
-**Last completed task:** Phase 5a EV engine landed end-to-end on branch `phase-5a-ev-engine`. New modules: `app/schemas/bets.py` (`BetCandidate` / `BetRecommendation` / `Portfolio`), `app/services/portfolio/sizing.py` (1/4 Kelly + 3% cap per ADR-002), `app/services/ev_engine/market_impact.py` (closed-form pari-mutuel post-bet odds), `app/services/ev_engine/calculator.py` (orchestrator over Win/Exacta/Trifecta/Superfecta via shared `_build_candidate` helper). PL gained `place_prob` / `show_prob` closed-form helpers (deferred for use; Phase 5a does not emit Place/Show — see ADR-039). Backtest validation script (`scripts/validate_phase5a_ev_engine.py`) runs end-to-end on the test slice with historical `odds_final` (ADR-040). **547 tests passing** (was 503 → +44 across Tasks 1-6).
-**Next task:** Phase 5b — Portfolio Optimiser. CVaR LP via Rockafellar-Uryasev + `scipy.optimize.linprog`; consumes `list[BetCandidate]`; produces `BetRecommendation`/`Portfolio`. CLAUDE.md §10 acceptance: "Assert CVaR constraint is binding at the limit." First step in Phase 5b should be capping `odds_final` in the validation script before the optimiser is wired in (see EV-engine smoke note below).
+**Phase:** Phase 5a — EV Engine **COMPLETE** · Phase 5b — Portfolio Optimiser **COMPLETE** · Phase 6 — Frontend **NEXT**.
+**Last completed task:** Phase 5b portfolio optimiser landed end-to-end on branch `worktree-agent-a876df5324605a63d`. New module: `app/services/portfolio/optimizer.py` (Rockafellar-Uryasev CVaR LP via `scipy.optimize.linprog(method="highs")` with vectorised Plackett-Luce Gumbel scenarios). PL gained `sample_orderings_vectorised` (Gumbel-Max trick, single-numpy-call PL sampling). Validation script gained `--max-decimal-odds` cap (default 100, drops 99/999 placeholders per ADR-040's flagged data-quality issue) and `--optimize` flag wiring (`evaluate(...)` now returns `(candidates, summary, portfolios)`; behaviour unchanged when not passed). ADR-041 documents the CVaR LP packing + per-race scope + 1000-scenario default. **557 tests passing** (was 541 in the non-API suite → +16: 10 optimizer + 6 PL sampler).
+**Next task:** Phase 6 — Frontend scaffold. Next.js 14 + Tailwind + Recharts; consumes the FastAPI surface to render race-card upload, probability bars, and the bet-execution ticket from Phase 5b's `Portfolio.recommendations`.
 
 ### Phase 5a smoke result — flagged for Phase 5b investigation
 
@@ -101,6 +101,58 @@ JP carries 1.6M rows with no speed figure. Either derive a synthetic speed figur
 ---
 
 ## Session Log
+
+### Session: 2026-05-13 (c) — Phase 5b portfolio optimiser (parallel-worktree agent)
+
+**Completed:**
+
+Phase 5b built end-to-end on branch `worktree-agent-a876df5324605a63d` in a single session as one of two parallel agents working from the merged-to-main Phase 5a baseline.
+
+*Task 1 — validation-script `--max-decimal-odds` cap*
+- `scripts/validate_phase5a_ev_engine.py` gained a `--max-decimal-odds` flag (default 100). Rows with `odds_final > cap` are dropped (set to NaN, race skipped) BEFORE `compute_ev_candidates` sees them. Drop count is logged via the existing `log.info("ev_engine.validate.odds_cap.applied", …)` structlog pattern and included in the report JSON summary as `n_rows_dropped_by_odds_cap` / `max_decimal_odds`. Fixes the ADR-040-flagged 99/999 placeholder-odds issue.
+- Same commit added the inert `--optimize` / `--bankroll` / `--cvar-alpha` / `--max-drawdown-pct` / `--n-scenarios` / `--seed` flags so Task 3's wiring needed only the optimizer module landing — the script's CLI surface was complete in one commit. `EVRunSummary` gained nine new fields, all with neutral defaults so the dataclass remains backward-compatible with Phase 5a's report-comparison tooling.
+
+*Task 2 — PL Gumbel sampler + CVaR LP optimiser + tests*
+- `app/services/ordering/plackett_luce.py` gained `sample_orderings_vectorised(strengths, n_samples, rng)`. Yellott / Gumbel-Max identity: `argsort(-(log_s + Gumbel(0,1)))` is distributed exactly as a single PL draw. One numpy uniform + log + log + argsort call generates the whole `(n_samples, n_horses)` matrix; ~100× faster than calling `sample_ordering` in a python loop.
+- `app/services/portfolio/optimizer.py` is the Rockafellar-Uryasev (2000) CVaR LP — see ADR-041 for the full decision-vector packing and LP matrix construction. Per-race scope: each `optimize_portfolio` call operates on one race's candidates. Per-race seeding (`np.random.default_rng([seed, hash(race_id) & 0xFFFFFFFF])`) makes results invariant to candidate ordering and stable across calls.
+- 6 PL sampler tests + 10 optimiser tests added. Critical assertions: per-recommendation `stake_fraction ≤ min(¼-Kelly cap, max_bet_fraction)`; `cvar_95 ≈ max_drawdown_pct × bankroll` when the CVaR constraint is binding (CLAUDE.md §10 requirement). Empty / negative-EV / out-of-range-selection / missing-race / LP-infeasible all exercised.
+
+*Task 3 — `--optimize` wiring smoke run*
+- `evaluate(...)` extended to lazy-import the optimiser and loop per race when `optimize=True`. Returns `(candidates, summary, portfolios)`; portfolios is empty when not optimising.
+- `scripts/smoke_phase5b_optimizer.py` is a synthetic smoke harness — the production parquet (~2.3M rows) and trained baseline models are gitignored and not present in clean worktrees, so this script generates a 200-race / 8-horse synthetic test slice (Dirichlet win probs, planted 999-odds placeholders) and runs it through `evaluate(...)`.
+- Smoke artifact: `models/baseline_full/ev_engine/phase-5b-smoke-001/report.json`. Output: 1600 synthetic rows → 348 dropped by 100-odds cap → 104 +EV candidates over 28 surviving races → 27 active portfolios with mean 2.74 recommendations and `mean_cvar_usd = $198.90` (well below the $2,000 cap on a $10K bankroll because few candidates per race).
+
+*Task 4 — ADR-041 + this progress entry*
+- ADR-041 documents (a) the Rockafellar-Uryasev LP form and decision-vector packing, (b) Gumbel-trick vectorised PL scenarios, (c) per-race scope (cross-race deferred, mirroring ADR-039), (d) the `n_scenarios=1000` default rationale, (e) USD reporting convention for VaR/CVaR.
+
+**Key decisions made (new ADRs):**
+
+- **ADR-041:** CVaR LP optimiser uses Rockafellar-Uryasev (2000) formulation via `scipy.optimize.linprog(method="highs")`, with per-race Monte Carlo scenarios drawn via the vectorised Gumbel-trick PL sampler. Scope is per-race (cross-race deferred until the card-level latent-state model exists, mirroring ADR-039). Default `n_scenarios=1000` chosen as the empirical sweet spot for ≲ 50 ms LP solves with ~14% Monte Carlo error at α=0.05.
+
+**Surprising / non-obvious findings to carry forward:**
+
+- **CLAUDE.md §8's Kelly formula is `(edge*odds − (1−edge))/odds`, NOT the classical `(p·b − q)/b`.** These are different formulas. With the project's formula, positive Kelly requires `edge > 1/(odds+1)`, a strictly tighter condition than `edge > 0` (which the EV calculator's `min_edge` filter already enforces). Consequence: many +EV candidates (with `expected_value > 0` and `edge > min_edge=0.05`) end up with `kelly_fraction = 0` and therefore zero stake fraction in the optimiser. The smoke run's first three iterations all produced 0 portfolios for this reason. Mentioned here so future Phase 5b consumers (and Phase 6 frontend developers showing "kelly cap" values to the user) know the discrepancy. ADR-002 explicitly mandates the project's formula; I did not second-guess it.
+
+- **Per-race RNG seeding via `np.random.default_rng([seed, hash(race_id) & 0xFFFFFFFF])` rather than a single global seed.** Without this, the order in which `optimize_portfolio` is called for different races would change the per-race scenario draws (because each call would consume from the same global Generator). With per-race seeding, swap two races in the validation loop and you get the same portfolios for each — important for reproducibility of regression artefacts.
+
+- **The training parquet is gitignored and is NOT in clean worktrees.** I expected to run the full backtest smoke against `data/exports/training_20260512.parquet`; the file doesn't exist in this worktree (or in main, post-clone). Built a synthetic smoke harness instead. The production smoke against the real parquet remains the Phase 5a `smoke-test-001` artifact — running it again is a follow-up task once the parquet is re-generated by re-running the export pipeline.
+
+- **`VaR / CVaR` are reported in USD, not as fractions.** `Portfolio.var_95 = bankroll * v` and `Portfolio.cvar_95 = bankroll * cvar_lhs`. Phase 6 frontend should display them as currency. The schema's field type is `float`; this is a convention, not a constraint.
+
+**Tests Status:**
+- Pre-Phase-5b baseline (non-API suite): 541 passing.
+- Phase 5b adds 16 tests (6 PL sampler + 10 optimiser): 557 passing.
+- Pre-existing `tests/test_api/test_ingest.py` is 6 errors in this worktree's Python 3.14 + sqlalchemy env (greenlet missing). Not regressions; unrelated to Phase 5b.
+- Total `pytest tests/` run: 557 passed, 6 errors (environment) — all 557 + 6 expected if the venv had a Python 3.11/3.12 fallback for sqlalchemy.
+
+**Known limitations carried forward into Phase 6 / Phase 7:**
+
+1. **Per-race scope only.** Cross-race correlation is deferred (ADR-041, mirrors ADR-039). When the card-level latent-state model lands, `optimize_portfolio` should be called once per CARD with all candidates rather than once per race.
+2. **`max_bet_fraction` is the CLAUDE.md §2 / ADR-002 3% cap.** No way to relax it per-race for high-confidence stakes; that would require an ADR amendment.
+3. **The synthetic smoke harness `scripts/smoke_phase5b_optimizer.py` is for CI / clean-clone parity, not for real validation.** The real smoke requires the training parquet. The parquet's regeneration is a Phase 0 concern.
+4. **No portfolio-level drift detection.** Phase 4's `app/services/calibration/drift.py` covers calibration drift; Phase 5b doesn't add a portfolio-level analogue (e.g., realised vs. expected loss CUSUM). Likely a Phase 7 deliverable.
+
+---
 
 ### Session: 2026-05-13 (b) — Phase 5a EV engine (subagent-driven)
 
