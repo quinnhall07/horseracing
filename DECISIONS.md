@@ -1765,3 +1765,102 @@ Decoupling the calculator from the odds source has three consequences:
 
 **Note on smoke-run data quality (carried forward to Phase 5b):**
 The first backtest smoke run (5% sample → 11,574 test rows / 8,717 races) produced 10,663 +EV candidates with mean edge 0.705 and mean EV/$ of 34.9 — both implausibly large. Root cause: the parquet's `odds_final` column contains extreme values (likely 99/999 placeholders for scratched or rare-payout horses) which, when fed into `1/odds`, produce near-zero market probabilities and therefore enormous nominal edges against ANY non-zero model probability. The EV engine is computing what it was asked; the data is the problem. Phase 5b should add an upper bound on `decimal_odds` at the validation-script level (suggested cap: ~100, dropping ~scratched/placeholder rows) before the portfolio optimiser will produce sensible results.
+
+---
+
+## ADR-042: Server-Side Inference Pipeline + Cards/Portfolio API Endpoints
+
+**Date:** 2026-05-13
+**Status:** Accepted
+**Phase:** Stream A (post-Phase 5a, unblocks Phase 6 frontend)
+
+**Context:**
+The Phase 6 frontend declares optional `model_prob` / `market_prob` / `edge`
+fields on each `HorseEntry` and a `Portfolio` shape mirroring
+`app/schemas/bets.py::Portfolio`. Without a server-side route that turns a
+persisted `RaceCard` into calibrated probabilities and bet recommendations,
+the frontend runs in MOCK mode. Stream A closes that gap.
+
+**Decision:**
+
+1. **Reusable inference module — `app/services/inference/pipeline.py`.**
+   * `InferenceArtifacts` dataclass aggregates the five sub-models +
+     meta-learner + meta-calibrator. `InferenceArtifacts.load(models_dir)`
+     is tolerant of missing optional sub-models (Speed/Form, Connections,
+     Market) — they fall back to the 0.5 neutral per ADR-026 — but is
+     strict about the meta-learner and meta-calibrator since those are
+     load-bearing.
+   * `build_inference_features(card)` synthesises the SAME column schema
+     `prepare_training_features` produces (per-horse priors + field-relative
+     normalisation + categoricals). The training pipeline's `groupby.shift(1)`
+     trick is unnecessary at inference time because `HorseEntry.pp_lines`
+     already excludes today's race — every PP row IS a prior result.
+   * `infer_calibrated_win_probs(...)` reproduces the validation-script
+     scoring sequence (`_score_test_slice`): orthogonalised sub-model stack
+     → meta-learner.predict_proba → meta-calibrator.predict_softmax. Per-race
+     softmax guarantees the vector sums to 1.0.
+   * `analyze_card(...)` is the end-to-end orchestrator. In live mode it
+     emits WIN candidates only — exotic per-permutation odds are not
+     available pre-race (per ADR-040). Decimal odds come from
+     `HorseEntry.morning_line_odds`, capped at `max_decimal_odds=100.0`
+     (the Phase 5b smoke-finding mitigation).
+
+2. **GET endpoints, not POST.**
+   * `GET /api/v1/cards/{card_id}` and `GET /api/v1/portfolio/{card_id}` both
+     use GET because inference is deterministic given (card, artifacts,
+     query parameters). GET is bookmarkable, cacheable by intermediaries,
+     and lets the frontend swap parameters via a URL change without form
+     submission. POST would imply mutation we don't perform.
+
+3. **In-memory per-card cache for hydrated probabilities.**
+   * `app.state.inference_cache` is a dict keyed by `card_id` holding the
+     per-race calibrated probability vectors. Repeated GETs reuse the
+     cached vectors — for a 10-race card this saves ~50 sub-model + meta
+     + calibrator invocations.
+   * Cache is process-local (lost on restart). Acceptable for paper-trading
+     scale; production would swap in Redis with a TTL. ALTERNATIVES
+     CONSIDERED: storing the probabilities in the DB alongside the parsed
+     card — REJECTED because retraining invalidates them and the DB write
+     path is on the ingestion hot loop. In-memory dict is the right
+     latency/freshness trade.
+
+4. **Multi-race portfolio aggregation in `/portfolio`.**
+   * The frontend's bet-execution ticket displays one flat list of
+     recommendations across the whole card. `analyze_card` returns one
+     `Portfolio` per race; the endpoint aggregates them by concatenating
+     `recommendations`, summing `expected_return` and `total_stake_fraction`
+     (capped at 1.0), and taking the MAX of per-race VaR/CVaR as the
+     conservative risk display. ALTERNATIVES CONSIDERED: returning the
+     list of per-race Portfolios — REJECTED because it makes the frontend
+     ticket render logic per-race when the user mental-model is per-card.
+
+5. **Interim portfolio constructor stands in for the missing Phase 5b LP.**
+   * `build_portfolio_from_candidates` uses each candidate's pre-capped
+     1/4 Kelly fraction (ADR-002) and scales the whole vector down by a
+     scalar `k ∈ (0, 1]` until the Monte-Carlo CVaR_α loss ≤
+     `max_drawdown_pct × bankroll`. This is NOT the Rockafellar-Uryasev
+     LP that Phase 5b will land — it's a tractable placeholder. The
+     interface (`list[BetCandidate] → Portfolio`) matches what the LP
+     will consume, so swapping is a single-file replacement.
+
+6. **Card persistence reuses the existing live ingestion DB.**
+   * `app/db/persistence.py` already converts an `IngestionResult` to ORM
+     rows. Stream A adds `load_card(session, card_id)` which rebuilds the
+     Pydantic `RaceCard` from the ORM tree via `selectinload` eager joins.
+     The ingest endpoint now sets `IngestionResult.card_id` to the DB
+     primary key (as string) so the frontend can roundtrip.
+
+**Rejected Alternatives:**
+* **POST /portfolio with body parameters.** Rejected — see point 2.
+* **Compute probabilities at ingestion time + persist them.** Rejected —
+  see point 3. Calibration / retraining decouples model lifecycle from
+  card lifecycle.
+* **Hold the inference path inside the validation script only and call
+  out to it as a subprocess.** Rejected — fragile, slow, and the API
+  needs first-class access for caching and error handling.
+
+**Carry-forward to Phase 5b:**
+The interim portfolio constructor in `pipeline.build_portfolio_from_candidates`
+will be replaced once `app/services/portfolio/optimizer.py` lands with
+the Rockafellar-Uryasev CVaR LP. The endpoint signature does not need
+to change.
