@@ -30,6 +30,13 @@ dependencies = [
     "python-multipart>=0.0.9",
     "sqlalchemy>=2.0",
     "aiosqlite>=0.20",
+    # SQLAlchemy's async layer (`sqlalchemy.ext.asyncio`) requires the
+    # `greenlet` package. On py3.11/3.12, `sqlalchemy[asyncio]` pulls it
+    # transitively; on py3.13/3.14 the wheel-selection logic has shifted
+    # and greenlet is sometimes left out of the resolved set, producing
+    # `ValueError: the greenlet library is required to use this function`
+    # the first time any AsyncSession is used. Pin it explicitly. (ADR-045)
+    "greenlet>=3.0",
     # Phase 3 — gradient-boosted baseline + classical ML utilities.
     "lightgbm>=4.3",
     "scikit-learn>=1.4",
