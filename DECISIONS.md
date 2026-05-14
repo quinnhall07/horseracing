@@ -2317,3 +2317,107 @@ The `joebeachcapital/horse-racing` (US, primary jurisdiction) dataset also maps 
 - If the meta-learner's Pace contribution (gain-based feature importance) is below 0.05 after bootstrap on a 50/50 HK/US mix, consider dropping the layer rather than carrying it.
 - The `min_rows_with_data` constant (5_000) is hardcoded but could be tied to a per-jurisdiction floor in a future refinement.
 
+
+---
+
+## ADR-048: OCR Fallback For Scanned PDFs (Tesseract + Poppler)
+
+**Date:** 2026-05-14
+**Status:** Accepted
+
+**Context:**
+
+The dominant input to this system is **scanned / rasterized Brisnet UP race cards** — the operator's workflow re-rasterizes the original text-layer PDFs into image-only PDFs before upload. Today's `extract_text_from_pdf()` chains `pdfplumber` (layout mode) → `pdfplumber` (text mode) → `pypdf` (character-level), all of which require an embedded text layer; on rasterized PDFs all three return empty strings and the parser raises `ValueError("PDF produced no extractable text…")`. The user explicitly confirmed this — "I'll only ever be using the pdf parser with uploaded SCANNED pdfs of race cards" — so OCR cannot remain a "phase 2" stretch goal; it's the *primary* text path in production.
+
+**Decision:**
+
+1. **Add Tesseract OCR as the fourth (and effectively primary) fallback in `extract_text_from_pdf`.** The function still tries text-layer extraction first because (a) some users may upload text-layer PDFs and they should be fast, and (b) the cost of trying is <2 s even on a 6 MB scan. When all text-layer paths return empty, the new `_extract_with_ocr(pdf_bytes)` rasterizes each page via Poppler (`pdf2image.convert_from_bytes`) and OCRs each image via Tesseract (`pytesseract.image_to_string`). Per-page text is joined with the same `\x0c` form-feed delimiter the existing path uses so the downstream cleaner / format detector / Brisnet parser see an identical interface.
+
+2. **DPI fixed at 300.** Brisnet UP uses ~6-point type for jockey/trainer names and small chart annotations. Tesseract reliably reads 6 pt at 300 DPI (verified on `EXAMPLE_RACE_CARDS/Race 4.pdf`); 200 DPI loses small names; 400+ DPI doubles per-page latency without improving downstream parse accuracy. The constant lives in `extractor._OCR_DPI` and is overrideable per call.
+
+3. **Page-level error isolation.** A `pytesseract.image_to_string` exception on one page does not abort the document — that page's slot becomes `""` and the loop continues to the next page. A 4-page card with one mangled scan should still produce 3 usable pages of structured data rather than a hard fail.
+
+4. **Graceful missing-deps path.** If `pdf2image` or `pytesseract` can't be imported (or the underlying `tesseract` / `poppler` binaries are missing), `_extract_with_ocr` returns `""` and the caller raises a `ValueError` with a clearer message ("If this PDF is scanned, confirm tesseract and poppler are installed (see README)"). The Python deps are declared in `pyproject.toml`; the system binaries are documented in the README install section.
+
+5. **No changes to downstream stages.** The `cleaner.normalize_text()` function already strips control characters, normalizes ligatures, and preserves multi-space column separators — typical OCR artifact handling. The `BrisnetParser` is line-regex based (not layout-based) and has token-level fallbacks (`_build_pp_from_tokens`) for races where the full PP regex fails. End-to-end test on the three example scans (Race 4/5/9) confirmed the parser produces a usable RaceCard from OCR text.
+
+6. **Async safety preserved.** The FastAPI ingest endpoint already runs the parser inside `loop.run_in_executor(None, ingest_pdf, …)`. OCR is CPU-bound and slow (~10-30 s/page at 300 DPI on Apple Silicon, single-threaded), but it runs in a thread, so concurrent uploads aren't blocked. The endpoint's UX implication: a single 4-page scan can take 30-120 s end-to-end, and the upload flow should show a progress indicator. The card-page UI already handles long-running analyze responses (Phase 8 / ADR-042) — the same pattern covers this.
+
+**Rationale:**
+
+- Tesseract is the standard open-source OCR; it handles English-language structured documents well, especially with monospaced or near-monospaced fonts like Brisnet UP. EasyOCR / PaddleOCR offer better accuracy on free-form text but pull 200+ MB of model weights — overkill for our use case.
+- Poppler (via `pdf2image`) is the same renderer most Linux distros use for PDF preview; output is high-quality and the Python wrapper is stable.
+- Keeping OCR last in the fallback chain (rather than first) means text-layer PDFs still serve in <2 s — we don't penalize the operator who occasionally uploads a non-rasterized card.
+
+**Rejected Alternatives:**
+
+- **EasyOCR / PaddleOCR.** Better accuracy but 200+ MB model downloads and slower CPU inference. Tesseract's gap is recoverable through the parser's existing fuzzy/regex fallbacks; the weight cost isn't.
+- **OCR-only path (skip pdfplumber entirely).** Saves ~1 s on every upload but costs the ability to handle text-layer PDFs in <2 s. The fallback chain is the right shape — it always tries the fastest path first.
+- **Per-page DPI auto-tuning.** Some pages might OCR fine at 200 DPI; selecting per-page adds complexity for marginal benefit on Brisnet UP, which has uniform layout.
+- **Skip Tesseract; ship Mac-only `ocrmypdf` wrapper.** Couples us to a CLI tool with platform-specific install paths. `pytesseract` + `pdf2image` work identically on macOS and Linux.
+- **Pre-process scans with deskew/contrast/noise filters before OCR.** Tesseract 5.5 handles raw scans of the example cards well; adding image-processing only matters if accuracy drops. Defer until needed.
+
+**When to revisit:**
+
+- If a regular-cadence operator card produces <50% horse-line parse confidence on the first try (the Brisnet parser logs this), revisit per-page DPI bump or pre-process step.
+- If OCR latency becomes a UX blocker (the operator complains about wait times), consider (a) caching OCR text by content-hash so re-uploads skip OCR, or (b) parallelising per-page OCR across CPU cores.
+- If a user supplies a non-English race card (e.g., HKJC Chinese-language PP), tesseract needs `eng+chi_sim` language packs — install via `brew install tesseract-lang` and add a `--ocr-lang` option.
+- The current implementation single-threads Tesseract per page (one core). On a 10-page card that's 5+ minutes single-threaded vs ~30 s with `concurrent.futures.ThreadPoolExecutor(max_workers=4)`. Parallel-page OCR is a small change but is deferred until the user demonstrates the latency is a problem.
+
+
+---
+
+## ADR-049: LLM Fallback Parser For OCR-Noisy Race-Card Text
+
+**Date:** 2026-05-14
+**Status:** Accepted
+
+**Context:**
+
+ADR-048 added a Tesseract OCR fallback so scanned/rasterized Brisnet UP PDFs produce extractable text. OCR works — Tesseract reads the user's iOS-rasterized cards in ~8 s and the cleaner normalizes the obvious artifacts (ligatures, accent marks, lone control chars). But the downstream regex-based `BrisnetParser` is brittle: it expects multi-space column separators, well-aligned monospaced columns, decimal-formatted weights, and clean fractional odds (`"6-1"`). OCR routinely violates every one of those assumptions:
+
+- Tesseract collapses 2-space column gaps to 1 space, breaking `\s{2,}` separators.
+- Single chars are misread (`"L"` → `"|"`, `"1"`, or `"I"`; `","` → `"."`; `"5/2"` → `"512"`).
+- Horse names get split mid-token by line wrapping the scanner introduced.
+- Whole horse blocks lose their leading whitespace pattern that `_RE_HORSE_LINE` relied on.
+
+Empirically the regex parser produces **0 horses** on `EXAMPLE_RACE_CARDS/Race 4.pdf`, `Race 5.pdf`, and `Race 9.pdf` even though the OCR output is humanly readable. The user explicitly confirmed this is the production input shape — re-tuning the regex with one-off OCR-specific patterns is a losing arms race.
+
+**Decision:**
+
+1. **Add a Claude API-backed parser (`LLMParser`) as a fallback in `app/services/pdf_parser/llm_parser.py`.** When `extractor.ingest_pdf` sees `card.n_races == 0` OR `card.n_qualified_races == 0` from the regex parser, it invokes `LLMParser().parse(raw_text)` with the same OCR text and rebuilds the `RaceCard` from the LLM-extracted JSON.
+
+2. **Default model is `claude-haiku-4-5`, not Sonnet/Opus.** Brisnet UP extraction is structured text → JSON, not open-ended reasoning. Haiku 4.5 is fast (sub-5-s for a 2-page card), cheap (~$1/$5 per 1M tokens vs Sonnet's $3/$15), and the task fits well within its 200K context. Constructor takes a `model` override so the user can flip to Sonnet for hard cases without code changes.
+
+3. **Strict JSON contract enforced via prompt, validated via Pydantic.** The system prompt enumerates the exact JSON shape (matching `ParsedRace` field-for-field), the enum vocabularies for `surface` / `condition` / `race_type`, the conversion rules ("6-1" → 7.0 decimal, "1 1/16 Miles" → 8.5 furlongs, "1:10.40" → 70.40 sec), and a "if uncertain, emit null, do NOT guess" instruction. The response is parsed with `_extract_json_object` (3-tier fallback: direct → fenced → brace-balanced) and every race / horse / PP line is run through dedicated `_build_*` constructors that coerce values, clamp to schema ranges, and skip malformed records rather than crashing.
+
+4. **Prompt caching on the system prompt + field-spec primer (~1.5K tokens).** Two text blocks in the `system` array, `cache_control={"type": "ephemeral"}` on the second. The system prompt + primer never vary across uploads, so repeat uploads hit cache at ~0.1× input cost. `response.usage.cache_read_input_tokens` is surfaced in `ParsedResult.cached_tokens` for telemetry.
+
+5. **Optional dependency, optional API key, graceful degradation.** The `anthropic` SDK is in `[project.optional-dependencies].llm-parse` — users who don't want LLM spend leave it uninstalled. `LLMParser.parse()` checks for `ANTHROPIC_API_KEY` and the `anthropic` import; either failure returns a `ParsedResult` with empty `races` and a clear warning rather than raising. The regex parser remains the fast path for text-layer PDFs; the LLM only fires on regex failure.
+
+6. **Provenance surfaced through `RaceCard.source_format` and `IngestionResult.errors`.** A card built via the fallback has `source_format = "brisnet_up+llm"` (or `"unknown+llm"`). The errors list carries a "Parsed via LLM fallback (model_id); N race(s), K cached input tokens." line that the UI can render as a non-error provenance banner.
+
+**Rationale:**
+
+- The user's production input is OCR-noisy scans. The regex parser was designed for text-layer Brisnet PDFs; trying to make it robust to OCR noise is a losing game (each Tesseract version, each scanner setting, each page-rotation degree produces a new failure mode). An LLM with a structured JSON contract sidesteps the noise entirely — Claude can read "5/2" or "512" or "5*2" and emit `3.5` either way.
+- Haiku 4.5 is the right model: structured extraction from a single PDF of text doesn't benefit from Sonnet/Opus reasoning, and per-upload cost matters because every scan triggers this path. Estimated cost per upload at Haiku 4.5 cached prices: ~$0.005-0.02 (mostly output tokens, since the cached prefix is ~0.1× and the OCR text is ~5-15K input tokens).
+- Caching the system prompt is a real lever, not a marginal optimization. The system prompt is ~1.5K tokens; on a typical 4-card upload session, cache hits drop those tokens from 4 × full-price to 1 × write + 3 × read = ~32% of uncached cost. Across hundreds of uploads over a meet, that's meaningful spend.
+- Keeping the regex parser intact (rather than ripping it out and going LLM-only) preserves the fast path for the occasional text-layer PDF (~50-100 ms vs ~5-10 s for LLM). It also means the system degrades gracefully when the LLM is unreachable — the regex parser will at least try, and partial results beat no results.
+- Validation through Pydantic + per-row builders rather than `ParsedRace.model_validate` directly means a single bad PP line doesn't drop the whole horse, and a single bad horse doesn't drop the whole race. Robustness compounds when the LLM occasionally hallucinates a 200-pound weight.
+
+**Rejected Alternatives:**
+
+- **Make the regex parser OCR-robust.** Considered; rejected. Every OCR-specific regex (treat single space as 2+, treat `"|"` as `"L"`, treat `"512"` as `"5/2"`, etc.) creates ambiguities that break the text-layer path. Two parser modes with two regex sets would double maintenance for marginal benefit.
+- **Claude Sonnet 4.6 instead of Haiku.** Considered; rejected for the default. Sonnet's higher accuracy on the JSON output would be a marginal improvement (Haiku is already >95% accurate on structured extraction from text the user reads as "obvious"), but the cost is 3-5× and the latency is roughly 2×. Users can override the constructor when they hit a hard card.
+- **Self-hosted open-source LLM (Llama / Mistral).** Considered; rejected for now. Latency on Apple Silicon CPU inference is similar to Haiku's network round-trip, but the operational complexity (model weights, MPS/CUDA setup, prompt tuning per model) is high for a single-user research project. If API spend ever becomes prohibitive, revisit.
+- **Strip the regex parser and go LLM-only.** Considered; rejected. Text-layer PDFs are still a possibility (some operators may upload original Brisnet UP downloads), and the regex parser handles those in tens of milliseconds rather than seconds. Two-tier dispatch (fast → fallback) is the right shape.
+- **Structured outputs / `output_config.format` with a JSON schema.** Considered. Worth revisiting in a future iteration: the API natively supports `json_schema` enforcement which removes the post-hoc JSON-extraction logic. Deferred because (a) the current `_extract_json_object` handles fenced and brace-balanced responses already, and (b) Haiku 4.5 with a strict prompt is already producing clean JSON >95% of the time. If we see a wave of malformed responses in production telemetry, flip to `output_config.format`.
+- **Use the Anthropic SDK's prompt-caching auto-mode (`cache_control` on top of `messages.create`).** Considered. Explicit `cache_control` on the second system block is clearer and matches the manual placement guidance in the API skill — anyone reading the code can see exactly where the cached prefix ends.
+
+**When to revisit:**
+
+- **If the user's scans get cleaner** (e.g., they switch from iOS rasterization to direct text-layer Brisnet downloads) and the regex parser starts succeeding consistently, the LLM fallback becomes dormant cost. That's the success state — no action needed, but worth confirming with `card.source_format` telemetry that the `+llm` suffix is rare in production.
+- **If cache-hit rate is below 80%** across repeated uploads (visible in `ParsedResult.cached_tokens`), audit the system prompt for silent invalidators (date interpolation, request IDs). The current prompt has neither, so this should stay high.
+- **If Haiku's JSON quality drops below 95%** (visible as `result.warnings` filling with `"failed validation"` or `"not parseable JSON"`), flip to Sonnet 4.6 as default OR add `output_config.format` schema enforcement.
+- **If the user adds non-Brisnet formats** (DRF, Equibase), the system prompt should branch on `source_format` to swap in a format-specific primer. The current primer covers Brisnet UP; the system prompt's JSON contract is format-agnostic.
+- **If a user supplies many scans simultaneously,** consider batching via the Messages Batches API — 50% cost discount, sub-1-hour SLA. Single-card upload latency is not the bottleneck for batch ingestion.

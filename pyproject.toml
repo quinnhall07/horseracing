@@ -19,6 +19,12 @@ dependencies = [
     "structlog>=24.1",
     "pdfplumber>=0.11",
     "pypdf>=4.2",
+    # OCR fallback for scanned / image-based PDFs (ADR-048). pdf2image
+    # needs poppler + pytesseract needs the tesseract binary — install via
+    # `brew install tesseract poppler` (macOS) or
+    # `apt-get install tesseract-ocr poppler-utils` (Linux).
+    "pdf2image>=1.16,<2.0",
+    "pytesseract>=0.3,<1.0",
     # Phase 0 — Kaggle ingestion + tabular data handling.
     "kaggle>=1.6",
     "pandas>=2.2",
@@ -59,6 +65,16 @@ dev = [
 # CPU works for inference; training is much faster with a GPU (CUDA/MPS).
 gpu = [
     "torch>=2.2",
+]
+# LLM-based fallback parser for OCR-noisy race-card text (Phase 9 / ADR-049).
+# Anthropic SDK is optional because (a) regex parser handles text-layer PDFs
+# without it and (b) users who don't want LLM spend can keep it uninstalled —
+# the extractor degrades gracefully when `ANTHROPIC_API_KEY` is unset OR the
+# SDK is missing. Install via:
+#     pip install -e .[llm-parse]
+# and set ANTHROPIC_API_KEY in the environment.
+llm-parse = [
+    "anthropic>=0.40",
 ]
 
 [tool.setuptools.packages.find]

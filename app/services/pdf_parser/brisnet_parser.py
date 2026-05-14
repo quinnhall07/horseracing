@@ -335,10 +335,16 @@ class BrisnetParser:
             distance_raw = m_dist.group(1).strip()
             distance_furlongs = parse_distance_to_furlongs(distance_raw) or 0.0
 
-        if distance_furlongs < 2.0:
+        # Plausibility floor + ceiling: 2.0–20.0 furlongs covers every
+        # thoroughbred race in existence. OCR-noisy distances frequently
+        # produce out-of-range garbage ("5000 f"); skip those races rather
+        # than letting the RaceHeader schema validation crash the whole
+        # parse. RaceHeader's own `<= 20` upper bound (in app/schemas/race.py)
+        # would raise a ValidationError on us otherwise.
+        if not (2.0 <= distance_furlongs <= 20.0):
             warnings.append(
-                f"Race {race_num}: could not extract a valid distance "
-                f"(raw='{distance_raw}'); skipping race"
+                f"Race {race_num}: distance {distance_furlongs} furlongs "
+                f"is implausible (raw='{distance_raw}'); skipping race"
             )
             return None
 

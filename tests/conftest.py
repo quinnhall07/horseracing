@@ -28,3 +28,10 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("LIGHTGBM_NUM_THREADS", "1")
+
+# Phase 9 / ADR-049 — placeholder API key so the LLM parser module imports
+# cleanly under test. Real API calls in tests are mocked; this avoids the
+# "ANTHROPIC_API_KEY not set" early-return path from masking real failures
+# when tests want to exercise the API call shape. Set BEFORE pytest collects
+# any module that reads the env at import time.
+os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
