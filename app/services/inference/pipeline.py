@@ -38,7 +38,11 @@ Public API
                                artifacts,
                                race_id)     ← np.ndarray per single race
     analyze_card(card, artifacts, …)        ← (probs_by_race, candidates, portfolios)
-    build_portfolio_from_candidates(...)    ← interim portfolio constructor (5b stub)
+    analyze_card_pareto(card, artifacts, …) ← (risk_level, aggregated_portfolio) pairs
+    build_portfolio_from_candidates(...)    ← interim Kelly-scaling constructor
+                                              (kept for backward-compat; the
+                                              Phase 5b R-U LP is now the
+                                              default — see ADR-045)
 
 Per ADR-040: the EV calculator is odds-source agnostic. Live mode
 extracts decimal odds from `HorseEntry.morning_line_odds`, caps them
@@ -76,6 +80,7 @@ from app.services.models.training_data import (
     ROLLING_WINDOW,
     FIRST_TIME_STARTER_FITNESS,
 )
+from app.services.portfolio.optimizer import optimize_portfolio
 from app.services.portfolio.sizing import apply_bet_cap
 
 log = get_logger(__name__)
@@ -530,6 +535,7 @@ def analyze_card(
     n_scenarios: int = DEFAULT_N_SCENARIOS,
     seed: int = DEFAULT_SEED,
     card_id: Optional[str] = None,
+    use_interim: bool = False,
 ) -> tuple[dict[str, np.ndarray], list[BetCandidate], list[Portfolio]]:
     """Full inference pipeline on a parsed RaceCard.
 
@@ -538,6 +544,13 @@ def analyze_card(
       candidates:      list[BetCandidate] across all races (sorted by EV desc)
       portfolios:      list[Portfolio], one per race when `optimize=True`,
                        else empty.
+
+    Per ADR-045: when `optimize=True` (the default), per-race candidates
+    are fed to the Phase 5b CVaR LP via `optimize_portfolio` — the
+    Rockafellar-Uryasev formulation with Plackett-Luce Gumbel scenarios.
+    Set `use_interim=True` to use the Stream A interim Monte-Carlo
+    Kelly-scaling constructor instead (kept for backward-compat with
+    earlier tests / callers; not recommended for production).
 
     Exotic bets (EXACTA / TRIFECTA / SUPERFECTA) are emitted only when the
     caller-supplied `exotic_odds` is non-empty. In live mode no exotic odds
@@ -625,17 +638,34 @@ def analyze_card(
         all_candidates.extend(cands)
 
         if optimize and cands:
-            portfolios.append(
-                build_portfolio_from_candidates(
-                    card_id=card_id or "live",
-                    candidates=cands,
-                    bankroll=bankroll,
-                    cvar_alpha=cvar_alpha,
-                    max_drawdown_pct=max_drawdown_pct,
-                    n_scenarios=n_scenarios,
-                    seed=seed,
+            if use_interim:
+                portfolios.append(
+                    build_portfolio_from_candidates(
+                        card_id=card_id or "live",
+                        candidates=cands,
+                        bankroll=bankroll,
+                        cvar_alpha=cvar_alpha,
+                        max_drawdown_pct=max_drawdown_pct,
+                        n_scenarios=n_scenarios,
+                        seed=seed,
+                    )
                 )
-            )
+            else:
+                # ADR-045: per-race CVaR LP via Rockafellar-Uryasev.
+                # `optimize_portfolio` is per-race; we feed it the single
+                # race's candidates + that race's win-prob vector.
+                portfolios.append(
+                    optimize_portfolio(
+                        candidates=cands,
+                        race_win_probs={race_id: win_probs_ordered},
+                        bankroll=bankroll,
+                        cvar_alpha=cvar_alpha,
+                        max_drawdown_pct=max_drawdown_pct,
+                        n_scenarios=n_scenarios,
+                        seed=seed,
+                        card_id=card_id or "live",
+                    )
+                )
 
     all_candidates.sort(key=lambda c: c.expected_value, reverse=True)
     log.info(
@@ -649,8 +679,14 @@ def analyze_card(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Portfolio construction (interim — Phase 5b optimiser is not yet built)
+# Portfolio construction
 # ──────────────────────────────────────────────────────────────────────────────
+#
+# The Phase 5b R-U LP (`app.services.portfolio.optimizer.optimize_portfolio`)
+# is the default portfolio constructor since ADR-045. The interim
+# Monte-Carlo Kelly-scaling constructor below (`build_portfolio_from_candidates`)
+# is preserved as a fallback for backward-compat with older callers and
+# tests — it is reachable through `analyze_card(..., use_interim=True)`.
 
 
 def build_portfolio_from_candidates(
@@ -662,11 +698,12 @@ def build_portfolio_from_candidates(
     n_scenarios: int = DEFAULT_N_SCENARIOS,
     seed: int = DEFAULT_SEED,
 ) -> Portfolio:
-    """Interim portfolio constructor.
+    """Interim portfolio constructor (pre-ADR-045 fallback).
 
-    Phase 5b's CVaR LP optimiser is not yet implemented (see PROGRESS.md
-    line 11 — "Phase 5b — Portfolio Optimiser. NEXT"). Until that lands,
-    Stream A constructs a portfolio by:
+    Phase 5b's CVaR LP (`optimize_portfolio`) is the default since
+    ADR-045. This function is preserved for backward-compat — callers
+    can opt back into it via `analyze_card(..., use_interim=True)`.
+    It constructs a portfolio by:
       * Using each candidate's pre-computed 1/4 Kelly fraction directly
         (already capped at 3% per bet via ADR-002).
       * Scaling all stakes down by a single factor `k ∈ (0, 1]` until the

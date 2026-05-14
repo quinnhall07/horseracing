@@ -397,3 +397,105 @@ def test_build_portfolio_total_stake_fraction_le_one():
         n_scenarios=200,
     )
     assert p.total_stake_fraction <= 1.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tests — analyze_card uses the R-U LP optimiser by default (ADR-045)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_analyze_card_default_uses_lp_optimizer(monkeypatch):
+    """Default (use_interim=False) must dispatch through the Phase 5b
+    `optimize_portfolio` LP. We patch it with a sentinel and assert the
+    interim constructor is never reached."""
+    from app.services.inference import pipeline as pipeline_mod
+
+    calls: list[dict] = []
+
+    def fake_optimize_portfolio(**kwargs):
+        calls.append(kwargs)
+        # Return a minimal valid Portfolio with no recs.
+        from app.schemas.bets import Portfolio
+        return Portfolio(
+            card_id=kwargs.get("card_id", "x"),
+            bankroll=kwargs["bankroll"],
+            recommendations=[],
+            expected_return=0.0,
+            var_95=0.0,
+            cvar_95=0.0,
+            total_stake_fraction=0.0,
+        )
+
+    def fail_interim(**_kwargs):
+        raise AssertionError("interim must not be called when use_interim=False")
+
+    monkeypatch.setattr(pipeline_mod, "optimize_portfolio", fake_optimize_portfolio)
+    monkeypatch.setattr(pipeline_mod, "build_portfolio_from_candidates", fail_interim)
+
+    card = _card()
+    artifacts = _make_artifacts()
+    _, candidates, portfolios = analyze_card(
+        card, artifacts, bankroll=10_000.0, min_edge=0.0, optimize=True
+    )
+    if candidates:
+        # If there were any candidates, the LP must have been invoked.
+        assert len(calls) >= 1
+        for k in calls:
+            assert "race_win_probs" in k
+            assert "cvar_alpha" in k
+            assert "max_drawdown_pct" in k
+            assert k["bankroll"] == 10_000.0
+
+
+def test_analyze_card_use_interim_routes_to_old_constructor(monkeypatch):
+    """When use_interim=True, the LP must NOT be called — backward compat."""
+    from app.services.inference import pipeline as pipeline_mod
+
+    interim_calls: list = []
+
+    def fake_interim(**kwargs):
+        interim_calls.append(kwargs)
+        from app.schemas.bets import Portfolio
+        return Portfolio(
+            card_id=kwargs.get("card_id", "x"),
+            bankroll=kwargs["bankroll"],
+            recommendations=[],
+            expected_return=0.0,
+            var_95=0.0,
+            cvar_95=0.0,
+            total_stake_fraction=0.0,
+        )
+
+    def fail_lp(**_kwargs):
+        raise AssertionError("optimize_portfolio must not be called when use_interim=True")
+
+    monkeypatch.setattr(pipeline_mod, "build_portfolio_from_candidates", fake_interim)
+    monkeypatch.setattr(pipeline_mod, "optimize_portfolio", fail_lp)
+
+    card = _card()
+    artifacts = _make_artifacts()
+    _, candidates, _ = analyze_card(
+        card, artifacts, bankroll=10_000.0, min_edge=0.0,
+        optimize=True, use_interim=True,
+    )
+    if candidates:
+        assert len(interim_calls) >= 1
+
+
+def test_analyze_card_lp_respects_adr_002_bet_cap():
+    """ADR-002: each stake_fraction must never exceed 3%. With the LP path
+    on (default), every per-race Portfolio's recommendations must respect
+    the per-bet cap."""
+    card = _card()
+    artifacts = _make_artifacts()
+    _, candidates, portfolios = analyze_card(
+        card, artifacts, bankroll=10_000.0, min_edge=0.0,
+        optimize=True, n_scenarios=200,
+    )
+    # Even if there are no candidates, the assertion below is vacuously true;
+    # but on a real call we expect at least a few portfolios.
+    for portfolio in portfolios:
+        for rec in portfolio.recommendations:
+            assert rec.stake_fraction <= 0.03 + 1e-9, (
+                f"stake_fraction {rec.stake_fraction} exceeds ADR-002 3% cap"
+            )
