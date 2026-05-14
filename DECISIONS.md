@@ -1765,3 +1765,106 @@ Decoupling the calculator from the odds source has three consequences:
 
 **Note on smoke-run data quality (carried forward to Phase 5b):**
 The first backtest smoke run (5% sample → 11,574 test rows / 8,717 races) produced 10,663 +EV candidates with mean edge 0.705 and mean EV/$ of 34.9 — both implausibly large. Root cause: the parquet's `odds_final` column contains extreme values (likely 99/999 placeholders for scratched or rare-payout horses) which, when fed into `1/odds`, produce near-zero market probabilities and therefore enormous nominal edges against ANY non-zero model probability. The EV engine is computing what it was asked; the data is the problem. Phase 5b should add an upper bound on `decimal_odds` at the validation-script level (suggested cap: ~100, dropping ~scratched/placeholder rows) before the portfolio optimiser will produce sensible results.
+
+---
+
+## ADR-044: Rolling-Window Retraining Is a Standalone Script, Drift-Triggered by Default
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+**Context:**
+Master Reference §4 Layer 7 ("Feedback + Online Learning") calls for the sub-models to be retrained on a rolling window — for example, the last 3 years — dropping the oldest data and incorporating the newest. The retrain is coordinated with the calibration drift detector: when the live CUSUM (Phase 4, ADR-036) alarms, a retrain should be triggered, and absent that signal a scheduled cadence still keeps the model fresh.
+
+This raises two design questions:
+
+1. **What is the default rolling-window length?**
+2. **Where does the retraining live — a long-running service or a standalone script?**
+
+**Decision:**
+
+### 1. Rolling-window default: **3 calendar years**
+
+`scripts/rolling_retrain.py --window-years 3`. The window is half-open: `[as_of_date − 3y, as_of_date)`. Rows on the as-of date itself are deliberately excluded so future races (the ones we'd actually bet on) never appear in training.
+
+Three years is the suggestion in Master Reference §183 and lands on a defensible operational compromise:
+- It spans **two full racing seasons plus a one-year buffer**, so the model has seen the same horses and connections at multiple ages and the calendar-seasonal pattern (Triple Crown trail, summer turf meets, Breeders' Cup prep) appears twice.
+- It is **long enough to fit the empirical-Bayes connections model** — three years of jockey-trainer pairings shrinks meaningfully toward each connection's true win rate at the per-jurisdiction `min_jockey_starts` / `min_trainer_starts` defaults.
+- It is **short enough to drop pre-COVID racing economics** (purse structures, takeout rates, jockey populations) from active training as those become structurally distant — pre-2022 racing in the US is materially different from post-2022 racing, and a 3y window will roll those out within the next refit cycle.
+
+The window length is configurable per-invocation, so a researcher can sweep it without code changes.
+
+### 2. Retraining mode: **drift-triggered by default, scheduled cadence opt-in**
+
+Two trigger modes are supported:
+
+- **Drift-triggered (default operational mode):** the live monitor writes a JSON marker (`save_drift_state` in `app/services/calibration/drift.py`) every time it processes a batch of (prediction, label) pairs. The retrain CLI reads that marker via `--skip-if-no-drift`. When the CUSUM has not alarmed, the script exits with code 2 — a distinctive no-op signal that lets a cron job branch on "calibration is fine, do not spend the GPU cycles." When it has alarmed, the script proceeds normally and exits 0.
+- **Scheduled cadence:** the same script run without `--skip-if-no-drift` always retrains. This is the fallback path for environments where the drift detector is not yet wired (e.g. before Stream B is integrated) and the simpler "retrain every Sunday" cron pattern.
+
+The two-mode design keeps the alerting layer (CUSUM) decoupled from the retraining layer (sub-models + meta + calibrator). Either can change independently as long as the JSON marker schema stays stable.
+
+### 3. Execution mode: **standalone script, not a service**
+
+`scripts/rolling_retrain.py` follows the same pattern as `scripts/bootstrap_models.py`, `scripts/validate_calibration.py`, and `scripts/db/*`: a single-shot CLI that imports from `app/` but does not require the FastAPI app to be running.
+
+Reasons:
+- **CLAUDE.md §11** explicitly mandates the Phase-0 pipeline scripts stay standalone. The same constraint applies here for the same reason: training jobs run on the largest available box (or a fresh GPU node), not on the API host.
+- **Cron-locality.** A cron job invokes a shell command; it does not negotiate with a long-running service. A standalone script is the cron-native shape.
+- **No FastAPI dependency.** The training pipeline imports `app.services.models.*` and `app.services.calibration.*`, none of which require an `asyncio` event loop. Lifting this into a service would mean either a synchronous endpoint that ties up a worker for the duration of the train (bad), or an async background task with all the lifecycle/cancellation/persistence concerns that come with that.
+- **Restartability.** The script writes artifacts atomically to a self-contained `output_dir`; if it crashes halfway through, the operator deletes the directory and re-runs. There is no shared state to roll back.
+
+### 4. Output layout: `models/rolling/<as_of_date>/`
+
+Mandated structure inside the directory:
+
+```
+models/rolling/2026-05-13/
+├── speed_form/            # SpeedFormModel.save() artifact
+├── connections/           # ConnectionsModel.save() artifact
+├── market/                # MarketModel.save() artifact
+├── meta_learner/          # MetaLearner.save() artifact
+├── calibrator/            # Calibrator.save() artifact (Platt/isotonic/identity)
+└── report.json            # top-level summary; see below
+```
+
+Pace / sequence sub-model directories are omitted by default — they are stubs (ADR-026) until their unblock conditions are met. Their entries still appear in `report.json` under `sub_models` with `"stub": true` so the report is self-describing.
+
+The as-of-date is used verbatim in the directory name so that:
+- The newest run is always lexicographically last under `models/rolling/`.
+- Diffing two runs (drift attribution) is a directory walk, not a database query.
+- The same as-of-date never produces two competing artifacts; re-running overwrites in place.
+
+`report.json` carries the required keys consumed by Stream A's inference pipeline and Stream B's drift monitor:
+`n_train_rows`, `n_calib_rows`, `n_test_rows`, `sub_models_trained`, `meta_learner_ece`, `meta_learner_brier`, `meta_learner_logloss`, `as_of_date`, `window_years`.
+
+**Rationale:**
+
+The drift-triggered default plus the standalone-script execution mode means a single cron entry covers both shapes:
+
+```cron
+# Every 6 hours: only spend cycles if the live monitor alarmed.
+0 */6 * * * cd $REPO && python scripts/rolling_retrain.py \
+    --parquet data/exports/training_latest.parquet \
+    --as-of-date $(date +%Y-%m-%d) \
+    --output-dir models/rolling/$(date +%Y-%m-%d) \
+    --skip-if-no-drift
+
+# Weekly belt-and-suspenders refit regardless of drift state.
+0 3 * * 0 cd $REPO && python scripts/rolling_retrain.py \
+    --parquet data/exports/training_latest.parquet \
+    --as-of-date $(date +%Y-%m-%d) \
+    --output-dir models/rolling/$(date +%Y-%m-%d)-weekly
+```
+
+Both lines call the same script with the same artifact layout; the only difference is the drift gate.
+
+**Rejected Alternatives:**
+- **5-year window:** rejected; pre-COVID racing economics distort the post-2022 distribution enough that the marginal training data is no longer drawn from the same population as the deployment data. Three years already includes two full Triple Crown cycles.
+- **1-year window:** rejected; too short for the connections empirical-Bayes shrinkage to land on stable rates, and a single Northern-Hemisphere season fails to teach the model the cross-season pattern.
+- **Retraining as an async FastAPI background task:** rejected; couples training cadence to the API process lifecycle. A multi-hour training job inside the request-handler container is the antipattern this project explicitly avoids (CLAUDE.md §11).
+- **Always retrain on cron, ignore drift state:** rejected; wastes compute and re-introduces calibrator churn for nominal random variation. The drift detector exists exactly to gate this. The cadence-only mode survives as the opt-in for environments where the drift detector is not yet wired.
+
+**When to revisit:**
+- When live racing data becomes available and the model is in active production — at that point, the 3-year window should be empirically validated against a 2-year and 4-year sweep on the live ledger (Stream B's outcomes log).
+- If GPU cost dominates (e.g. when the Sequence/Transformer model trains), revisit whether a smaller window is acceptable — sequence layers have a steeper compute curve in N than LightGBM does.
+- If the parquet ever grows enough that a 3y slice is too small for stable LightGBM fits in a niche jurisdiction, switch to an explicit `--min-rows` floor and pad with older data.
