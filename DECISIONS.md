@@ -2149,3 +2149,49 @@ Both lines call the same script with the same artifact layout; the only differen
 - When live racing data becomes available and the model is in active production — at that point, the 3-year window should be empirically validated against a 2-year and 4-year sweep on the live ledger (Stream B's outcomes log).
 - If GPU cost dominates (e.g. when the Sequence/Transformer model trains), revisit whether a smaller window is acceptable — sequence layers have a steeper compute curve in N than LightGBM does.
 - If the parquet ever grows enough that a 3y slice is too small for stable LightGBM fits in a niche jurisdiction, switch to an explicit `--min-rows` floor and pad with older data.
+
+---
+
+## ADR-045: Pareto-Frontier Endpoint + Real CVaR LP in Inference Pipeline
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+**Context:**
+Stream A's `analyze_card` shipped with an interim Monte-Carlo Kelly-scaling portfolio constructor (`build_portfolio_from_candidates`) because Stream A branched from the pre-Phase-5b main and didn't have access to the Rockafellar-Uryasev LP. With Phase 5b now merged, the inference pipeline can use the real LP. Separately, the frontend's UX is designed around a *risk/return curve* — the user wants to see the whole pareto frontier (return at each CVaR cap) and pick a point, not commit to a single drawdown number up front.
+
+**Decision:**
+
+1. **`analyze_card` defaults to the R-U LP** (`app.services.portfolio.optimizer.optimize_portfolio`). The interim constructor (`build_portfolio_from_candidates`) is preserved and reachable via `analyze_card(..., use_interim=True)` for callers that still want the placeholder semantics, but every default call path now goes through the LP. No API or schema change.
+
+2. **New `analyze_card_pareto(...)` function** in `app/services/inference/pipeline.py`. Runs the expensive candidate-generation pipeline (sub-models + meta-learner + calibrator + EV calculator) ONCE, then re-solves only the per-race LP at each requested risk level. For an N-race card with K risk levels: 1 ML pass + N×K cheap LP solves (≲ 50 ms each). Returns `tuple[list[(risk_level, aggregated_card_portfolio)], n_candidates_total]`.
+
+3. **New `GET /api/v1/portfolio/{card_id}/pareto`** endpoint. Query params mirror `/portfolio/{id}` plus `risk_levels` (comma-separated CSV, default `"0.05,0.10,0.15,0.20,0.25,0.30"`). Returns `ParetoFrontier` JSON. Aggregation rule matches ADR-042: concat recommendations across races, sum return/stake, max VaR/CVaR (conservative).
+
+4. **Risk-level grid default = 6 points from 0.05 to 0.30** in 0.05 increments. Six points is enough to draw a curve without overwhelming the LP solver budget (6×N solves) or the visualization. Configurable per request — 1 to 12 values, each in (0, 1], strictly increasing after parse. Out-of-range / non-numeric / duplicate values → 400.
+
+5. **GET (not POST)** for `/pareto`, same rationale as ADR-042: deterministic given inputs, bookmarkable, cacheable.
+
+6. **`greenlet` pinned in `pyproject.toml`** because sqlalchemy[asyncio] needs it but on py3.13/3.14 the wheel-selection logic shifted and it sometimes drops out of the resolved set. Explicit pin matches the pre-existing 6 `tests/test_api/test_ingest.py` errors that Stream A flagged.
+
+7. **New schemas `ParetoPoint` and `ParetoFrontier`** in `app/schemas/bets.py` (mirrored 1:1 in `frontend/lib/types.ts` by Stream Z).
+
+**Rationale:**
+
+- Re-using `analyze_card(optimize=False)` to compute the once-per-call candidate set keeps `analyze_card_pareto` thin: it just groups candidates by race, then loops the optimizer. The expensive feature engineering and meta-learner inference are not duplicated.
+- The endpoint solves N×K LPs serially. For a typical card (8 races, 6 risk levels = 48 solves, ≲ 50 ms each) total inference cost is well under 5 s. Parallelising the inner loops would help on giant cards but is overkill for the demo path.
+- The pareto frontier MUST be monotone non-decreasing in expected_return as risk loosens, because higher `max_drawdown_pct` is a strictly looser constraint on the same LP. We test this invariant (`test_pareto_monotone_in_expected_return`).
+- Returning the full Portfolio per point (not just summary stats) means the frontend slider can switch points without a round-trip. Payload is small — even 6 portfolios × ~10 recommendations × ~250 bytes JSON = ~15 KB per response.
+
+**Rejected Alternatives:**
+
+- **Compute one portfolio per request, frontend polls 6 times.** Rejected: 6× the network cost for the same total work, awkward loading UX (the curve renders piecewise as fetches return).
+- **Return only summary stats per point, lazy-fetch the bets when the user clicks.** Rejected: the additional click-time latency would break the "slide along the curve and watch the bets update" interaction model. Payloads are small enough that returning the full portfolio per point is the right trade.
+- **Use a continuous slider with the LP re-solved on every drag tick.** Rejected: the LP isn't free (50 ms/race) and the user wouldn't perceive sub-0.05 granularity in CVaR anyway. Discrete 6-stop snap is the right resolution.
+- **Risk-adjusted scalar objective (mean − λ·CVaR)** instead of a pareto sweep. Rejected: the user's mental model is "show me my options across the risk-return tradeoff"; collapsing to a scalar throws away the choice.
+
+**When to revisit:**
+
+- When the LP solve gets slower (e.g., Sequence-Transformer-derived strengths grow scenario count), revisit whether to parallelise per-race solves with `concurrent.futures`.
+- When live tote ingestion lands, the pareto endpoint should pre-fetch live odds before each LP solve. The contract doesn't change.
+- If users want different default risk-grid (e.g., 0.01-0.05 conservative-only or 0.20-0.50 high-roller), the `risk_levels` query param already covers it — no schema change needed.

@@ -679,6 +679,149 @@ def analyze_card(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Pareto frontier (ADR-045)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+DEFAULT_RISK_LEVELS: tuple[float, ...] = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30)
+"""Six risk levels covering conservative → aggressive (per ADR-045)."""
+
+
+def analyze_card_pareto(
+    card: RaceCard,
+    artifacts: InferenceArtifacts,
+    *,
+    risk_levels: Sequence[float] = DEFAULT_RISK_LEVELS,
+    bankroll: float = DEFAULT_BANKROLL,
+    min_edge: float = DEFAULT_MIN_EDGE,
+    max_decimal_odds: float = DEFAULT_MAX_DECIMAL_ODDS,
+    cvar_alpha: float = DEFAULT_CVAR_ALPHA,
+    n_scenarios: int = DEFAULT_N_SCENARIOS,
+    seed: int = DEFAULT_SEED,
+    card_id: Optional[str] = None,
+) -> tuple[list[tuple[float, Portfolio]], int]:
+    """Compute the risk/return Pareto frontier — one Portfolio per risk level.
+
+    Returns:
+      points: list of (max_drawdown_pct, aggregated_card_portfolio) tuples,
+              in the same order as `risk_levels`.
+      n_candidates_total: total candidate count across all races (pre-LP).
+
+    Implementation strategy (ADR-045): run candidate generation ONCE
+    (the expensive sub-model + meta-learner + calibrator + EV-calculator
+    pipeline) and re-solve only the LP at each risk level. For a 10-race
+    card with ~5 candidates per race and 6 risk levels, this is one ML
+    pass + 60 cheap LP solves vs. 6 full pipelines.
+    """
+    if not risk_levels:
+        raise ValueError("risk_levels must contain at least one entry")
+    for rl in risk_levels:
+        if not (0.0 < rl <= 1.0):
+            raise ValueError(f"each risk_level must be in (0, 1]; got {rl}")
+
+    # Candidate generation runs once. `optimize=False` skips the LP entirely.
+    race_win_probs, all_candidates, _ = analyze_card(
+        card,
+        artifacts,
+        bankroll=bankroll,
+        min_edge=min_edge,
+        max_decimal_odds=max_decimal_odds,
+        optimize=False,
+        cvar_alpha=cvar_alpha,
+        n_scenarios=n_scenarios,
+        seed=seed,
+        card_id=card_id,
+    )
+
+    n_candidates_total = len(all_candidates)
+    points: list[tuple[float, Portfolio]] = []
+
+    if not all_candidates:
+        # No candidates → empty Portfolio at every risk level.
+        for rl in risk_levels:
+            points.append(
+                (
+                    rl,
+                    Portfolio(
+                        card_id=card_id or "live",
+                        bankroll=bankroll,
+                        recommendations=[],
+                        expected_return=0.0,
+                        var_95=0.0,
+                        cvar_95=0.0,
+                        total_stake_fraction=0.0,
+                    ),
+                )
+            )
+        return points, n_candidates_total
+
+    # Group candidates by race once.
+    by_race: dict[str, list[BetCandidate]] = {}
+    for cand in all_candidates:
+        by_race.setdefault(cand.race_id, []).append(cand)
+
+    for rl in risk_levels:
+        per_race: list[Portfolio] = []
+        for race_id, cands in by_race.items():
+            if race_id not in race_win_probs:
+                continue
+            per_race.append(
+                optimize_portfolio(
+                    candidates=cands,
+                    race_win_probs={race_id: race_win_probs[race_id]},
+                    bankroll=bankroll,
+                    cvar_alpha=cvar_alpha,
+                    max_drawdown_pct=rl,
+                    n_scenarios=n_scenarios,
+                    seed=seed,
+                    card_id=card_id or "live",
+                )
+            )
+        aggregated = _aggregate_per_race_portfolios(
+            card_id or "live", per_race, bankroll
+        )
+        points.append((rl, aggregated))
+
+    log.info(
+        "inference.pareto_complete",
+        n_risk_levels=len(risk_levels),
+        n_candidates_total=n_candidates_total,
+        n_races=len(by_race),
+    )
+    return points, n_candidates_total
+
+
+def _aggregate_per_race_portfolios(
+    card_id: str, portfolios: list[Portfolio], bankroll: float
+) -> Portfolio:
+    """Card-level aggregation (per ADR-042): concat recs, sum return/stake,
+    worst-case (max) VaR/CVaR."""
+    if not portfolios:
+        return Portfolio(
+            card_id=card_id,
+            bankroll=bankroll,
+            recommendations=[],
+            expected_return=0.0,
+            var_95=0.0,
+            cvar_95=0.0,
+            total_stake_fraction=0.0,
+        )
+    recs: list[BetRecommendation] = []
+    for p in portfolios:
+        recs.extend(p.recommendations)
+    total_stake_fraction = min(1.0, sum(p.total_stake_fraction for p in portfolios))
+    return Portfolio(
+        card_id=card_id,
+        bankroll=bankroll,
+        recommendations=recs,
+        expected_return=float(sum(p.expected_return for p in portfolios)),
+        var_95=float(max(p.var_95 for p in portfolios)),
+        cvar_95=float(max(p.cvar_95 for p in portfolios)),
+        total_stake_fraction=float(total_stake_fraction),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Portfolio construction
 # ──────────────────────────────────────────────────────────────────────────────
 #
@@ -883,9 +1026,11 @@ __all__ = [
     "DEFAULT_MAX_DRAWDOWN_PCT",
     "DEFAULT_MIN_EDGE",
     "DEFAULT_N_SCENARIOS",
+    "DEFAULT_RISK_LEVELS",
     "DEFAULT_SEED",
     "InferenceArtifacts",
     "analyze_card",
+    "analyze_card_pareto",
     "build_inference_features",
     "build_portfolio_from_candidates",
     "infer_calibrated_win_probs",

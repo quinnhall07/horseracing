@@ -92,4 +92,26 @@ class Portfolio(BaseModel):
     total_stake_fraction: Annotated[float, Field(ge=0.0, le=1.0)]
 
 
-__all__ = ["BetCandidate", "BetRecommendation", "Portfolio"]
+class ParetoPoint(BaseModel):
+    """One point on the risk/return frontier — Portfolio solved at a given CVaR cap."""
+
+    max_drawdown_pct: Annotated[float, Field(gt=0.0, le=1.0)]
+    portfolio: Portfolio
+
+
+class ParetoFrontier(BaseModel):
+    """The full frontier — N Portfolios at N distinct CVaR caps. See ADR-045."""
+
+    card_id: str
+    bankroll: Annotated[float, Field(gt=0.0)]
+    n_candidates_total: Annotated[int, Field(ge=0)]
+    frontier: list[ParetoPoint]
+
+
+__all__ = [
+    "BetCandidate",
+    "BetRecommendation",
+    "Portfolio",
+    "ParetoPoint",
+    "ParetoFrontier",
+]
