@@ -18,6 +18,7 @@ from typing import Annotated, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.schemas.provenance import ModelProvenance
 from app.schemas.race import BetType
 
 
@@ -90,6 +91,7 @@ class Portfolio(BaseModel):
     var_95: float
     cvar_95: float
     total_stake_fraction: Annotated[float, Field(ge=0.0, le=1.0)]
+    model_provenance: Optional[ModelProvenance] = None
 
 
 class ParetoPoint(BaseModel):
@@ -106,11 +108,13 @@ class ParetoFrontier(BaseModel):
     bankroll: Annotated[float, Field(gt=0.0)]
     n_candidates_total: Annotated[int, Field(ge=0)]
     frontier: list[ParetoPoint]
+    model_provenance: Optional[ModelProvenance] = None
 
 
 __all__ = [
     "BetCandidate",
     "BetRecommendation",
+    "ModelProvenance",
     "Portfolio",
     "ParetoPoint",
     "ParetoFrontier",

@@ -59,6 +59,7 @@ SELECT
     rr.beaten_lengths_q1,
     rr.beaten_lengths_q2,
     rr.data_quality_score,
+    h.dedup_key         AS horse_dedup_key,
     h.name_normalized   AS horse_name,
     h.foaling_year,
     h.sire,

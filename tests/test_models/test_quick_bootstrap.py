@@ -89,6 +89,14 @@ def test_quick_bootstrap_end_to_end_produces_loadable_artifacts(tmp_path: Path):
     assert "warning" in marker
     assert "not meaningful" in marker["warning"].lower()
 
+    # Unified provenance file is present and matches ModelProvenance schema.
+    prov = json.loads((out / "BOOTSTRAP_PROVENANCE.json").read_text())
+    assert prov["is_synthetic"] is True
+    assert prov["bootstrap_script"] == "scripts/quick_bootstrap.py"
+    assert "speed_form" in prov["sub_models"]
+    assert set(prov["stub_sub_models"]) >= {"pace_scenario", "sequence"}
+    assert prov["warning"] and "not meaningful" in prov["warning"].lower()
+
     # Every artifact round-trips through its loader.
     SpeedFormModel.load(out / "speed_form")
     ConnectionsModel.load(out / "connections")

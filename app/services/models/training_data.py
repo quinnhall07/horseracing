@@ -99,11 +99,15 @@ def _race_id(df: pd.DataFrame) -> pd.Series:
 
 
 def _horse_key(df: pd.DataFrame) -> pd.Series:
-    """Per-horse grouping key. `horse_name` from the parquet is already the
-    normalized name (h.name_normalized in the SQL), but it isn't globally
-    unique — different horses across years/jurisdictions can share names.
-    Adding jurisdiction reduces collisions enough for training; the full
-    fix is to expose horses.dedup_key from the master DB export."""
+    """Per-horse grouping key. Prefers the master-DB `horse_dedup_key` (a
+    SHA-256 of (name, foaling_year, country) — globally unique by construction
+    per DATA_PIPELINE.md). Falls back to the legacy `horse_name|jurisdiction`
+    compromise when the column is missing — see ADR-027 for the history."""
+    if "horse_dedup_key" in df.columns and df["horse_dedup_key"].notna().any():
+        # 100% non-null in v2 exports; if any row leaks through with NaN,
+        # back-fill from the legacy key so groupby still has something stable.
+        legacy = df["horse_name"].astype(str) + "|" + df["jurisdiction"].astype(str)
+        return df["horse_dedup_key"].astype("string").fillna(legacy)
     return df["horse_name"].astype(str) + "|" + df["jurisdiction"].astype(str)
 
 
@@ -300,6 +304,33 @@ SPEED_FORM_FEATURE_COLUMNS: list[str] = [
 addition is an ADR (downstream artifacts encode the column order)."""
 
 
+def three_way_time_split(
+    df: pd.DataFrame,
+    train_frac: float = 0.60,
+    cal_frac: float = 0.20,
+    date_col: str = "race_date",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Sort by date, then slice into [train | calib | test] by row quantile.
+
+    Per ADR-003 — never random. Calibration slice sits between train and test,
+    so the calibrator sees model behaviour on a held-out window that's still
+    in-distribution relative to test.
+    """
+    if not (0 < train_frac < 1) or not (0 < cal_frac < 1) or train_frac + cal_frac >= 1:
+        raise ValueError(
+            f"Bad split fractions train={train_frac}, cal={cal_frac}; both must be"
+            f" in (0, 1) and sum to < 1."
+        )
+    sorted_df = df.sort_values(date_col).reset_index(drop=True)
+    n = len(sorted_df)
+    n_train = int(n * train_frac)
+    n_cal = int(n * cal_frac)
+    train = sorted_df.iloc[:n_train].reset_index(drop=True)
+    calib = sorted_df.iloc[n_train : n_train + n_cal].reset_index(drop=True)
+    test = sorted_df.iloc[n_train + n_cal :].reset_index(drop=True)
+    return train, calib, test
+
+
 __all__ = [
     "EWM_ALPHA",
     "ROLLING_WINDOW",
@@ -308,4 +339,5 @@ __all__ = [
     "load_training_parquet",
     "prepare_training_features",
     "time_based_split",
+    "three_way_time_split",
 ]

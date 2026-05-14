@@ -53,6 +53,13 @@ dev = [
     "reportlab>=4.0",        # build small PDFs for extractor tests
     "httpx>=0.27",           # FastAPI TestClient backend
 ]
+# Sequence (Transformer) sub-model — Layer 1c. Optional because torch is
+# heavy (~750MB wheel) and only needed for the Sequence model. Install via
+#     pip install -e .[gpu]
+# CPU works for inference; training is much faster with a GPU (CUDA/MPS).
+gpu = [
+    "torch>=2.2",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -52,6 +52,7 @@ the race when any horse is missing odds.
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 from datetime import date
@@ -63,6 +64,7 @@ import pandas as pd
 
 from app.core.logging import get_logger
 from app.schemas.bets import BetCandidate, BetRecommendation, Portfolio
+from app.schemas.provenance import ModelProvenance
 from app.schemas.race import BetType, HorseEntry, ParsedRace, PastPerformanceLine, RaceCard
 from app.services.calibration.calibrator import Calibrator
 from app.services.ev_engine.calculator import compute_ev_candidates
@@ -137,6 +139,16 @@ class InferenceArtifacts:
     meta_calibrator: Calibrator
     models_dir: Path
     available_sub_models: tuple[str, ...] = field(default_factory=tuple)
+    provenance: ModelProvenance = field(
+        default_factory=lambda: ModelProvenance(
+            is_synthetic=True,
+            warning=(
+                "BOOTSTRAP_PROVENANCE.json missing — treating loaded models as "
+                "synthetic. Re-run scripts/bootstrap_models.py on a real "
+                "training parquet to clear this warning."
+            ),
+        )
+    )
 
     @classmethod
     def load(
@@ -172,12 +184,15 @@ class InferenceArtifacts:
             except Exception as exc:  # noqa: BLE001
                 log.warning("inference.speed_form_load_failed", error=str(exc))
 
-        # ── Pace + Sequence are scaffolding-only; load() always succeeds and
-        # returns a neutral fallback per their module docstrings. We still
-        # call .load() so the dataclass slots aren't None — predict_proba
-        # returns 0.5 either way.
+        # ── Pace + Sequence: both can be either trained (ADR-046/047 — the
+        # parquet provides the data) or a 0.5-fallback stub. Either way,
+        # .load() returns a usable instance.
         pace = PaceScenarioModel.load(models_dir / "pace_scenario")
         sequence = SequenceModel.load(models_dir / "sequence")
+        if getattr(pace, "is_fitted", False):
+            available.append("pace_scenario")
+        if getattr(sequence, "is_fitted", False):
+            available.append("sequence")
 
         # ── Connections (Layer 1d)
         connections: Optional[ConnectionsModel] = None
@@ -219,10 +234,13 @@ class InferenceArtifacts:
         meta_calibrator = Calibrator.load(cal_path)
         available.append("meta_calibrator")
 
+        provenance = _load_provenance(models_dir)
+
         log.info(
             "inference.artifacts_loaded",
             models_dir=str(models_dir),
             available=available,
+            is_synthetic=provenance.is_synthetic,
         )
 
         return cls(
@@ -235,6 +253,43 @@ class InferenceArtifacts:
             meta_calibrator=meta_calibrator,
             models_dir=models_dir,
             available_sub_models=tuple(available),
+            provenance=provenance,
+        )
+
+
+def _load_provenance(models_dir: Path) -> ModelProvenance:
+    """Read BOOTSTRAP_PROVENANCE.json next to the loaded artifacts.
+
+    Falls back to a synthetic-flagged ModelProvenance with a warning when the
+    file is missing or unreadable — the dataclass default is identical to this
+    fallback, so callers can rely on `provenance.is_synthetic` always being a
+    safe bool to switch on.
+    """
+    path = models_dir / "BOOTSTRAP_PROVENANCE.json"
+    if not path.exists():
+        return ModelProvenance(
+            is_synthetic=True,
+            warning=(
+                f"BOOTSTRAP_PROVENANCE.json missing from {models_dir} — treating "
+                "loaded models as synthetic. Re-run scripts/bootstrap_models.py "
+                "on a real training parquet to clear this warning."
+            ),
+        )
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("inference.provenance_unreadable", path=str(path), error=str(exc))
+        return ModelProvenance(
+            is_synthetic=True,
+            warning=f"BOOTSTRAP_PROVENANCE.json unreadable: {exc}",
+        )
+    try:
+        return ModelProvenance.model_validate(payload)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("inference.provenance_invalid", path=str(path), error=str(exc))
+        return ModelProvenance(
+            is_synthetic=True,
+            warning=f"BOOTSTRAP_PROVENANCE.json invalid: {exc}",
         )
 
 

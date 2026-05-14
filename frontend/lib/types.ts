@@ -178,11 +178,34 @@ export interface RaceCard {
   card_date: string | null;
   track_code: string | null;
   races: ParsedRace[];
+  model_provenance?: ModelProvenance | null;
 
   // UI-only — populated by the analyze endpoint (or mock) to identify the
   // persisted card. The /upload backend returns the persisted card_id on
   // the IngestionResult; mock mode synthesises one.
   card_id?: string;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// ModelProvenance — describes which bootstrap run produced the loaded models.
+// Surfaced on every prediction-bearing response so the UI can flag
+// synthetic-trained predictions clearly. Mirrors app/schemas/provenance.py.
+// ────────────────────────────────────────────────────────────────────────────
+
+export interface ModelProvenance {
+  is_synthetic: boolean;
+  trained_at?: string | null;
+  n_train_rows?: number | null;
+  n_calib_rows?: number | null;
+  n_test_rows?: number | null;
+  sub_models: string[];
+  stub_sub_models: string[];
+  meta_learner_test_ece?: number | null;
+  meta_learner_test_brier?: number | null;
+  bootstrap_script?: string | null;
+  bootstrap_seed?: number | null;
+  parquet_path?: string | null;
+  warning?: string | null;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -242,6 +265,7 @@ export interface Portfolio {
   var_95: number;
   cvar_95: number;
   total_stake_fraction: number;
+  model_provenance?: ModelProvenance | null;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -264,4 +288,5 @@ export interface ParetoFrontier {
   /** Pre-filter candidate count fed into each LP solve. */
   n_candidates_total: number;
   frontier: ParetoPoint[];
+  model_provenance?: ModelProvenance | null;
 }

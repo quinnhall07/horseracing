@@ -282,8 +282,27 @@ function buildCard(): RaceCard {
     track_code: "CD",
     races,
     card_id: "mock-cd-2026-05-10",
+    model_provenance: SYNTHETIC_PROVENANCE,
   };
 }
+
+const SYNTHETIC_PROVENANCE = {
+  is_synthetic: true,
+  trained_at: null,
+  n_train_rows: null,
+  n_calib_rows: null,
+  n_test_rows: null,
+  sub_models: ["speed_form", "connections", "market"],
+  stub_sub_models: ["pace_scenario", "sequence"],
+  meta_learner_test_ece: null,
+  meta_learner_test_brier: null,
+  bootstrap_script: "mock",
+  bootstrap_seed: 42,
+  parquet_path: null,
+  warning:
+    "Mock demo data — the live frontend MOCK fallback is rendering this card. " +
+    "All numbers below are illustrative, not real predictions.",
+};
 
 const MOCK_CARD: RaceCard = buildCard();
 
@@ -353,6 +372,7 @@ function buildPortfolio(card: RaceCard): Portfolio {
     var_95: Number((-0.04 * BANKROLL).toFixed(2)),
     cvar_95: Number((-0.085 * BANKROLL).toFixed(2)),
     total_stake_fraction: Number(totalStakeFrac.toFixed(4)),
+    model_provenance: SYNTHETIC_PROVENANCE,
   };
 }
 
@@ -551,5 +571,6 @@ export function mockParetoFrontier(
     bankroll,
     n_candidates_total: nCandidates,
     frontier: raw,
+    model_provenance: SYNTHETIC_PROVENANCE,
   };
 }

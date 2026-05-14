@@ -24,6 +24,8 @@ from typing import Annotated, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.schemas.provenance import ModelProvenance
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Enumerations
@@ -364,6 +366,7 @@ class RaceCard(BaseModel):
     card_date: Optional[date] = None  # inferred from races; None if inconsistent
     track_code: Optional[str] = None  # inferred from races
     races: list[ParsedRace] = Field(default_factory=list)
+    model_provenance: Optional[ModelProvenance] = None
 
     @property
     def n_races(self) -> int:

@@ -163,7 +163,9 @@ async def get_card(
             )
         cache[card_id] = cached
 
-    return _hydrate_card(card, cached)
+    hydrated = _hydrate_card(card, cached)
+    hydrated.model_provenance = artifacts.provenance
+    return hydrated
 
 
 __all__ = ["router"]

@@ -332,23 +332,48 @@ def run_rolling_retrain(
         trained.append("speed_form")
 
     if "pace_scenario" in requested:
+        # ADR-047: real LightGBM fit when the parquet supplies the per-horse
+        # sectional columns (e.g. the gdaley/horseracing-in-hk slug populates
+        # them). Falls back to the 0.5 stub otherwise.
         pace_trainable = PaceScenarioModel.is_trainable_with(train)
-        summary["sub_models"]["pace_scenario"] = {
-            "trainable": pace_trainable,
-            "stub": not pace_trainable,
-        }
         if pace_trainable:
-            # Reserved: when the parquet eventually has fraction data the
-            # pace model gains a real fit() — until then this branch never
-            # runs and we keep the constant-0.5 stub (ADR-026).
-            log.info("rolling_retrain.pace_skipped_pending_fractions")
+            pace = PaceScenarioModel().fit(train, val_df=calib)
+            pace_dir = output_dir / "pace_scenario"
+            pace.save(pace_dir)
+            summary["sub_models"]["pace_scenario"] = {
+                "path": str(pace_dir),
+                "trainable": True,
+                "stub": False,
+            }
+            trained.append("pace_scenario")
         else:
-            log.info("rolling_retrain.pace_stub", reason="fractional data missing")
+            summary["sub_models"]["pace_scenario"] = {
+                "trainable": False,
+                "stub": True,
+            }
+            log.info("rolling_retrain.pace_stub", reason="fractional data missing or below row threshold")
 
     if "sequence" in requested:
-        summary["sub_models"]["sequence"] = {"trainable": False, "stub": True}
-        log.info("rolling_retrain.sequence_stub",
-                 reason="pytorch dep + unique horse_id required")
+        # ADR-046: SequenceModel is trainable when torch is importable and the
+        # parquet carries a horse identifier (horse_dedup_key or the legacy
+        # horse_name|jurisdiction pair). `is_trainable_with` gates both.
+        sequence_trainable = SequenceModel.is_trainable_with(train)
+        if sequence_trainable:
+            sequence = SequenceModel().fit(train, val_df=calib)
+            seq_dir = output_dir / "sequence"
+            sequence.save(seq_dir)
+            summary["sub_models"]["sequence"] = {
+                "path": str(seq_dir),
+                "trainable": True,
+                "stub": False,
+            }
+            trained.append("sequence")
+        else:
+            summary["sub_models"]["sequence"] = {"trainable": False, "stub": True}
+            log.info(
+                "rolling_retrain.sequence_stub",
+                reason="torch missing or horse identifier absent",
+            )
 
     if "connections" in requested:
         connections = ConnectionsModel().fit(train, val_df=calib)

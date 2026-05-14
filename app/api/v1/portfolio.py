@@ -178,6 +178,7 @@ async def get_portfolio(
         )
 
     aggregated = _aggregate_portfolios(card_id, portfolios, bankroll)
+    aggregated.model_provenance = artifacts.provenance
     log.info(
         "portfolio.served",
         card_id=card_id,
@@ -317,6 +318,7 @@ async def get_pareto_frontier(
         bankroll=bankroll,
         n_candidates_total=n_candidates_total,
         frontier=frontier,
+        model_provenance=artifacts.provenance,
     )
 
 

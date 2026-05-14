@@ -202,32 +202,9 @@ def generate_synthetic_results(
     return df
 
 
-# ── Time-based split (60/20/20) ─────────────────────────────────────────────
+# ── Time-based split (60/20/20) — hoisted to training_data module ──────────
 
-
-def three_way_time_split(
-    df: pd.DataFrame,
-    train_frac: float = 0.60,
-    cal_frac: float = 0.20,
-    date_col: str = "race_date",
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Sort by date, then slice into [train | calib | test] by row quantile.
-
-    Per ADR-003 — never random. Calibration slice sits between train and test.
-    """
-    if not (0 < train_frac < 1) or not (0 < cal_frac < 1) or train_frac + cal_frac >= 1:
-        raise ValueError(
-            f"Bad split fractions train={train_frac}, cal={cal_frac}; both must be"
-            f" in (0, 1) and sum to < 1."
-        )
-    sorted_df = df.sort_values(date_col).reset_index(drop=True)
-    n = len(sorted_df)
-    n_train = int(n * train_frac)
-    n_cal = int(n * cal_frac)
-    train = sorted_df.iloc[:n_train].reset_index(drop=True)
-    calib = sorted_df.iloc[n_train : n_train + n_cal].reset_index(drop=True)
-    test = sorted_df.iloc[n_train + n_cal :].reset_index(drop=True)
-    return train, calib, test
+from app.services.models.training_data import three_way_time_split  # noqa: E402,F401
 
 
 # ── Sub-model stacking (mirrors bootstrap_models._stack_sub_predictions) ────
@@ -402,24 +379,48 @@ def quick_bootstrap(
     }
 
     # 6. Marker file + summary.
-    print("[6/6] Writing marker file + summary…")
+    print("[6/6] Writing marker + provenance + summary…")
+    warning_text = (
+        "These models are trained on randomly-generated data. Their "
+        "predictions are not meaningful. Re-run scripts/bootstrap_models.py "
+        "on a real parquet for production."
+    )
+    trained_at = datetime.now(timezone.utc).isoformat()
+
+    # Legacy marker — retained for backward compat with existing tests + tools.
     marker = {
         "is_synthetic": True,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": trained_at,
         "n_synthetic_rows": int(len(features)),
         "n_synthetic_races": int(n_synthetic_races),
         "seed": seed,
-        "warning": (
-            "These models are trained on randomly-generated data. Their "
-            "predictions are not meaningful. Re-run bootstrap_models.py on a "
-            "real parquet for production."
-        ),
+        "warning": warning_text,
         "produced_by": "scripts/quick_bootstrap.py",
     }
     with open(output_dir / "QUICK_BOOTSTRAP.json", "w") as fh:
         json.dump(marker, fh, indent=2)
 
+    # Unified provenance file — matches app/schemas/provenance.py::ModelProvenance.
+    provenance = {
+        "is_synthetic": True,
+        "trained_at": trained_at,
+        "n_train_rows": int(summary.get("rows_train", 0)) or None,
+        "n_calib_rows": int(summary.get("rows_calib", 0)) or None,
+        "n_test_rows": int(summary.get("rows_test", 0)) or None,
+        "sub_models": ["speed_form", "connections", "market"],
+        "stub_sub_models": ["pace_scenario", "sequence"],
+        "meta_learner_test_ece": summary.get("meta_test_ece"),
+        "meta_learner_test_brier": summary.get("meta_test_brier"),
+        "bootstrap_script": "scripts/quick_bootstrap.py",
+        "bootstrap_seed": int(seed),
+        "parquet_path": None,
+        "warning": warning_text,
+    }
+    with open(output_dir / "BOOTSTRAP_PROVENANCE.json", "w") as fh:
+        json.dump(provenance, fh, indent=2)
+
     summary["marker_file"] = str(output_dir / "QUICK_BOOTSTRAP.json")
+    summary["provenance_file"] = str(output_dir / "BOOTSTRAP_PROVENANCE.json")
     summary["elapsed_seconds"] = round(time.monotonic() - t_start, 2)
     with open(output_dir / "summary.json", "w") as fh:
         json.dump(summary, fh, indent=2, default=str)

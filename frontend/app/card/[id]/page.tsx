@@ -7,6 +7,7 @@ import { ArrowLeft, CheckCheck, ChevronDown, ChevronRight, Loader2 } from "lucid
 import BetTicket from "@/components/BetTicket/BetTicket";
 import HorseTable from "@/components/HorseTable/HorseTable";
 import ParetoCurve from "@/components/ParetoCurve/ParetoCurve";
+import ProvenanceBanner from "@/components/ProvenanceBanner/ProvenanceBanner";
 import RaceHeader from "@/components/RaceCard/RaceHeader";
 import RiskSlider from "@/components/ParetoCurve/RiskSlider";
 import { getCard, getParetoFrontier } from "@/lib/api";
@@ -208,6 +209,10 @@ export default function CardPage({ params }: PageProps) {
           </div>
         </div>
       </header>
+
+      <ProvenanceBanner
+        provenance={card.model_provenance ?? frontier?.model_provenance}
+      />
 
       {!frontier ? (
         <div className="flex min-h-[40vh] items-center justify-center text-sm text-slate-400">

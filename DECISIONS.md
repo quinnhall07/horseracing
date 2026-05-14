@@ -2195,3 +2195,125 @@ Stream A's `analyze_card` shipped with an interim Monte-Carlo Kelly-scaling port
 - When the LP solve gets slower (e.g., Sequence-Transformer-derived strengths grow scenario count), revisit whether to parallelise per-race solves with `concurrent.futures`.
 - When live tote ingestion lands, the pareto endpoint should pre-fetch live odds before each LP solve. The contract doesn't change.
 - If users want different default risk-grid (e.g., 0.01-0.05 conservative-only or 0.20-0.50 high-roller), the `risk_levels` query param already covers it — no schema change needed.
+
+---
+
+## ADR-046: SequenceModel (Layer 1c) Is Trainable; Supersedes ADR-026 For This Layer
+
+**Date:** 2026-05-13
+**Status:** Accepted (supersedes the Sequence portion of ADR-026)
+
+**Context:**
+
+ADR-026 declared Layer 1c (the Sequence-Transformer-over-PP-history sub-model) a permanent stub returning 0.5 because two prerequisites weren't yet met:
+
+1. PyTorch was not in the dependency set — adding it would force every install to pull a ~750 MB wheel for a sub-model that wasn't trainable anyway.
+2. The per-row horse identifier (`horse_name + jurisdiction`) collided across years/jurisdictions, so a Transformer that consumed a horse's "career history" would mix unrelated horses' sequences together. ADR-027 documented the legacy fallback and pointed at `horses.dedup_key` from the master DB as the proper unblock.
+
+Step 5 of the Phase-8 plan resolves both:
+
+* `pyproject.toml` exposes `[project.optional-dependencies.gpu] = ["torch>=2.2"]`. The base install path keeps working; `is_trainable_with(df)` returns False when torch isn't importable, and `predict_proba()` falls back to 0.5.
+* `scripts/db/export_training_data.py` now includes `h.dedup_key AS horse_dedup_key` in the canonical SELECT. The training parquet carries a 100% non-null globally-unique horse ID.
+
+**Decision:**
+
+1. **Layer 1c is now a real Transformer encoder.** `app/services/models/sequence.py` defines:
+    - `SequenceModelConfig` — embedding_dim 64, num_heads 4, num_layers 2, max_sequence_length 30, dropout 0.1; AdamW lr 1e-4, weight_decay 1e-2, batch 256, 10 epochs, cosine-decay LR with 5%-of-total-steps linear warmup.
+    - `SequenceEncoder` (internal) — feature projection → CLS-prepended Transformer encoder with learned positional embedding → LayerNorm → concat with a projected today-context vector → linear head → BCEWithLogitsLoss.
+    - `SequenceModel.fit(train_df, val_df)` — builds per-row sequences via groupby(`horse_dedup_key`) + slice priors, standardises per-feature on the train slice only, runs the train loop, persists state_dict + scalers + metadata.
+    - `SequenceModel.predict_proba(df)` — emits one P(win) per input row. Rows with zero prior PP lines (first-time-starters) bypass the encoder and return 0.5.
+    - `is_trainable_with(df)` — gates on torch importability + horse-id presence; lets `bootstrap_models.py` skip the layer gracefully when prerequisites are missing.
+
+2. **Bootstrap integration.** `scripts/bootstrap_models.py` calls `SequenceModel.is_trainable_with(train)` and, when true, fits the model on the train slice with the calibration slice as `val_df` (early-stop signal). The Sequence's per-row P(win) joins the stacked feature matrix the meta-learner consumes — same contract as Speed/Form, Connections, and Market.
+
+3. **Today-race context.** Pure PP-only history under-uses the meta-learner: the Transformer would output a generic "horse strength" without considering whether today's race is on the same surface or at the same distance. The encoder gets a *separate* today-context vector (distance, field_size, weight, purse, surface one-hot) which is concatenated with the CLS output before the head. Today's outcome is never an input — only conditions knowable pre-race.
+
+4. **Per-feature standardisation fit on train slice only.** Mean/std computed over non-padding tokens. Padding tokens are zeroed after standardisation. Saved alongside the state_dict for inference-time reuse.
+
+5. **No-priors fallback.** A horse with zero prior PP rows produces an all-pad sequence. The encoder's all-pad-mask softmax would NaN, so the encoder masks all-pad rows to "no padding" (the CLS attends to zero-token-bias) and the orchestrator overrides those rows' output to 0.5 — the documented neutral fallback.
+
+6. **MPS-compatible.** Auto-detects device (`mps` on Apple Silicon, `cuda` on Nvidia, `cpu` otherwise). `enable_nested_tensor=False` set explicitly to silence the pre-LN nested-tensor incompatibility warning. Tests pin device="cpu" for determinism.
+
+**Rationale:**
+
+- A Transformer is the right structural choice — variable-length history per horse, attention over heterogeneous prior races (surface/distance/recency all matter unevenly), and the meta-learner already does the credit-allocation against simpler features.
+- The optional-dep path keeps `pip install -e .` lean. Operators who don't want the Sequence model never pay for torch. Adding it later is a one-liner: `pip install -e .[gpu]`.
+- Standardisation on train slice only is the ADR-029 invariant. We re-stamp it here because the feature engineering for sequences lives in this module (not `training_data.prepare_training_features`); the no-leakage rule still applies.
+- Today-context as a parallel input avoids the awkwardness of stitching today's row into the historical sequence (which row order? padding pattern would treat today specially). A simple concat-at-head is cleaner.
+- The same module exports the (lazy, factory-built) `_SequenceEncoder` nn.Module subclass behind a function so the file is importable without torch. The meta-learner imports `SequenceModel` unconditionally; making the encoder a closure means torch is only paid for at fit/predict time, not at import time.
+
+**Rejected Alternatives:**
+
+- **RNN/LSTM instead of a Transformer.** Rejected: Transformers handle the irregular spacing (recency vs. distant career segments) more naturally via attention; LSTMs over-weight recent tokens by construction. For sequences of length ≤ 30 the Transformer is also faster on commodity GPUs.
+- **Train SequenceModel from scratch on every meta-learner refresh.** Rejected: the Sequence model needs more data per epoch than the daily/weekly retrain cadence supplies. Bootstrap once on the master DB; refresh quarterly with rolling_retrain.
+- **Make torch a hard dep.** Rejected: most operators of this repo will never need the Sequence model. A 750 MB optional dep is the right shape.
+- **Use today's race row as the FINAL sequence token (with finish_pct masked).** Rejected: introduces a "is-this-row-today?" flag that the model has to learn to ignore for the masked feature, and entangles padding semantics. The parallel today-context input is mechanically cleaner.
+
+**When to revisit:**
+
+- When the master DB grows past ~10M results, increase `embedding_dim` to 128 and `num_layers` to 3. Current config is tuned for the 2.6M-row v1 export.
+- When live tote odds become available pre-race, add them to `today_context_columns` — they're a strong signal the model currently doesn't see.
+- When jurisdiction-specific behaviour matters (US Beyer figures vs. UK Timeform vs. JP figures are not directly comparable), add a `jurisdiction` token at sequence position 0 as a learned "domain" prompt.
+- The Pace sub-model's stub remains in place per ADR-026; ADR-047 captures the Pace decision separately.
+
+
+---
+
+## ADR-047: PaceScenarioModel Becomes Trainable On HK Sectional Data; Pace Unblock Path Documented
+
+**Date:** 2026-05-13
+**Status:** Accepted (supersedes the Pace portion of ADR-026)
+
+**Context:**
+
+ADR-026 declared Layer 1b (Pace Scenario) a permanent stub because no source dataset on disk populated `fraction_q1_sec`, `fraction_q2_sec`, `beaten_lengths_q1`, or `beaten_lengths_q2`. The v2 master DB build acquired `gdaley/horseracing-in-hk` — a Kaggle dataset that ships per-horse sectional-time data in `runs.csv` (cumulative `time1`..`time6` and `behind_sec1`..`behind_sec6`). The pace columns now populate at 100% non-null for the 79,295 HK rows after the field map and preprocessor were updated to read them.
+
+The `joebeachcapital/horse-racing` (US, primary jurisdiction) dataset also maps `frac1`/`frac2` per its field-map entry, but is gated behind Kaggle's terms-acceptance flow and was inaccessible at this session's bootstrap time (403 Forbidden). The user-supplied datasets included `gdaley/horseracing-in-hk` and `zygmunt/horse-racing-dataset`; only the former carries fractional data and only that one was integrated.
+
+**Decision:**
+
+1. **`PaceScenarioModel` is rewritten as a real LightGBM binary classifier** modelled on `SpeedFormModel`. Features:
+    - 4 raw pace columns (`fraction_q1_sec`, `fraction_q2_sec`, `beaten_lengths_q1`, `beaten_lengths_q2`).
+    - 3 derived per-row (`fraction_q1_per_furlong`, `fraction_q2_delta`, `beaten_lengths_delta`).
+    - 3 field-relative (`pace_pressure` = race-wide std of fraction_q1, `beaten_lengths_q1_rank`, `fraction_q1_zscore`).
+    - 2 race-context scalars (`distance_furlongs`, `field_size`) and the standard 4 categoricals.
+
+2. **Trainability gate uses absolute row count, not percentage.** `is_trainable_with` requires `min_rows_with_data ≥ 5_000` of non-null pace rows (default; tunable per `PaceScenarioConfig`). The prior 10%-of-rows threshold rejected the v2 export because HK is 3% of total — even though 79K is a perfectly usable training corpus for the pace head. The new gate is row-count first, fraction-pct as a sanity floor.
+
+3. **`predict_proba` is 0.5-safe.** Rows without pace data — i.e., the 97% of the v2 parquet that's JP / UK / AR — return 0.5. LightGBM would otherwise reject object-dtype null columns; the model masks those rows out and lets the meta-learner orthogonalise the constant feature away (per CLAUDE.md §2).
+
+4. **Field map update for `gdaley/horseracing-in-hk`.** The slug already had an entry but didn't reference the sectional columns. Added:
+    - `fraction_q1_sec ← runs.time1`
+    - `fraction_q2_sec ← runs.time2`
+    - `fraction_finish_sec ← runs.finish_time`
+    - `beaten_lengths_q1 ← runs.behind_sec1`
+    - `beaten_lengths_q2 ← runs.behind_sec2`
+    Plus `preprocess: "gdaley_horseracing_in_hk_merge"` to merge runs + races on `race_id`.
+
+5. **`gdaley/hkracing` (older, smaller HK slug) was REMOVED from the v2 build.** It overlaps 100% with `gdaley/horseracing-in-hk` (same race_dedup_keys) but lacks the sectional columns. Keeping both would require a per-result UPSERT strategy or source-priority logic; replacing the smaller with the larger is simpler.
+
+6. **`bootstrap_models.py` and `rolling_retrain.py` fit Pace when `is_trainable_with` returns True.** Otherwise they preserve the 0.5-stub fallback. `BOOTSTRAP_PROVENANCE.json` records `pace_scenario` under `sub_models` (trained) or `stub_sub_models` (not trained), so the UI banner correctly reflects current capability.
+
+7. **Source-acceptance friction is documented.** Three Kaggle slugs in the field-map registry require a one-time browser visit + Download click before the API serves their data (joebeachcapital/horse-racing, zygmunt/horse-racing-dataset, gdaley/horseracing-in-hk). The README and `data/db/_pipeline_skipped.log` mechanism flag this when ingestion 403s.
+
+**Rationale:**
+
+- Pace is structurally orthogonal to Speed/Form: a horse with a great speed figure can still get gunned on the lead and tire badly, or rate kindly off a slow pace and pounce. The meta-learner needs the signal as its own input.
+- Even with only HK rows carrying pace data, the meta-learner will learn whether to upweight Pace on HK rows vs. ignore it elsewhere — the model's job is to discover where each sub-model's signal lives, not the bootstrap's.
+- Implementing Pace now (vs. waiting for US data) avoids the situation where the parquet has data the system can't use. Re-bootstrapping when joebeachcapital becomes accessible is a one-liner that doesn't require code changes.
+- LightGBM (not a neural network) for Pace mirrors the Speed/Form decision: pace features are tabular, low-dimensional, and tree splits capture interactions (e.g., "if you were within 1 length at q1 AND lengths-behind didn't grow at q2, win prob jumps"). A NN would over-parametrise for the labelled-row count.
+
+**Rejected Alternatives:**
+
+- **(a) Accept the stub.** Rejected: the user explicitly opted for (c) — sourcing data. With pace data now in the parquet, leaving the model as a stub would discard a working sub-model worth of meta-learner input.
+- **(b) Derive a synthetic pace proxy from `fraction_finish_sec` deltas.** Rejected for this session: HK gives us real per-call data, which is qualitatively stronger than a derived single-number proxy. The proxy approach remains a fallback if the meta-learner's SHAP attribution on the real Pace head ends up below a usefulness threshold — that would warrant rerunning option (b) on JP/UK to broaden the signal coverage.
+- **Lower the gate's 10% threshold instead of replacing it with row count.** Rejected: a relative threshold makes Pace trainability dependent on the total parquet size — adding more JP data would push Pace below 10% again even though absolute pace-row count grew. Row count is the right invariant.
+- **UPSERT-replace gdaley/hkracing rows in place.** Rejected for this session: implementing a source-priority upsert is real plumbing in `load_to_db.py` and outside the Step 5/6 scope. Replacing the smaller dataset wholesale is mechanically simpler and the data lost is strictly a subset of what we just loaded.
+
+**When to revisit:**
+
+- When `joebeachcapital/horse-racing` becomes accessible, the parquet will have US pace data alongside HK's. Re-bootstrap and verify the Pace head's test AUC holds or improves on the broader jurisdiction mix.
+- When live tote ingestion lands for US races, the Pace model should still produce calibrated outputs even on rows where the live PDF doesn't have fraction data — the 0.5-fallback contract guards this.
+- If the meta-learner's Pace contribution (gain-based feature importance) is below 0.05 after bootstrap on a 50/50 HK/US mix, consider dropping the layer rather than carrying it.
+- The `min_rows_with_data` constant (5_000) is hardcoded but could be tied to a per-jurisdiction floor in a future refinement.
+

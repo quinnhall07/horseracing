@@ -90,13 +90,20 @@ secrets.json
 # ── scripts/bootstrap_models.py; not deterministic across dep versions)    ──
 # Historical validation reports (calibration*/, ev_engine/) remain tracked.
 models/baseline_full/QUICK_BOOTSTRAP.json
+models/baseline_full/BOOTSTRAP_PROVENANCE.json
 models/baseline_full/speed_form/booster.txt
 models/baseline_full/speed_form/metadata.json
 models/baseline_full/connections/model.json
 models/baseline_full/market/model.json
 models/baseline_full/meta_learner/booster.txt
 models/baseline_full/meta_learner/metadata.json
+models/baseline_full/pace_scenario/
+models/baseline_full/sequence/
 models/baseline_full/summary.json
 models/baseline_full/calibration_adr038_brier/meta_learner/metadata.json
 models/baseline_full/calibration_adr038_brier/speed_form/metadata.json
 models/rolling/
+models/smoke_phase8/
+
+# User-supplied raw data uploads (handled outside the standard pipeline).
+data/imported\ dbs/

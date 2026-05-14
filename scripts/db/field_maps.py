@@ -300,24 +300,35 @@ FIELD_MAPS: dict[str, dict[str, Any]] = {
     "gdaley/horseracing-in-hk": {
         "source_format": "csv",
         "jurisdiction":  "HK",
+        "preprocess":    "gdaley_horseracing_in_hk_merge",
+        # Same race-shape as gdaley/hkracing but the runs CSV carries sectional
+        # times + per-call lengths-behind — ADR-047 keys off these to make the
+        # Pace sub-model trainable. The IDs-only schema (horse_id, jockey_id,
+        # trainer_id) means we synthesise display names from the IDs.
         "race_fields": {
-            "track_code":        "venue",
+            "track_code":        "venue",          # "ST" / "HV"
             "race_date":         "date",
             "race_number":       "race_no",
-            "distance_furlongs": "distance",            # metres in source
-            "surface":           "surface",
+            "distance_furlongs": "distance",       # metres in source
+            "surface":           "surface",        # 0/1 numeric flag
             "condition":         "going",
-            "race_type":         "class",
+            "race_type":         "race_class",
             "purse_usd":         "prize",
         },
         "result_fields": {
-            "horse_name":        "horse_name",
-            "finish_position":   "place",
-            "jockey":            "jockey",
-            "trainer":           "trainer",
+            "horse_name":        "horse_id",       # stringified int; HK uses IDs
+            "finish_position":   "result",
+            "jockey":            "jockey_id",
+            "trainer":           "trainer_id",
             "odds_final":        "win_odds",
             "weight_lbs":        "actual_weight",
-            "speed_figure":      "rating",
+            "speed_figure":      "horse_rating",
+            # ADR-047: pace data from the runs.csv sectional columns.
+            "fraction_q1_sec":   "time1",          # cumulative seconds at 1st call
+            "fraction_q2_sec":   "time2",          # cumulative seconds at 2nd call
+            "fraction_finish_sec": "finish_time",
+            "beaten_lengths_q1": "behind_sec1",
+            "beaten_lengths_q2": "behind_sec2",
         },
         "transformers": {
             "distance_furlongs": "metres_to_furlongs",
