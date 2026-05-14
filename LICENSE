@@ -1,0 +1,121 @@
+PROPRIETARY SOFTWARE LICENSE — ALL RIGHTS RESERVED
+
+Copyright (c) 2026 Quinn Hall. All rights reserved.
+
+This software, including all source code, models, weights, training data,
+algorithms, schemas, documentation, configuration, and any other materials
+contained in this repository (collectively, the "Software"), is the sole
+and exclusive property of the copyright holder.
+
+NO LICENSE GRANTED
+------------------
+No license, express or implied, by estoppel or otherwise, to any
+intellectual property rights is granted by this document. Possession of,
+access to, or receipt of the Software, in source or compiled form, does
+NOT grant any right to use, copy, modify, merge, publish, distribute,
+sublicense, sell, host, deploy, or create derivative works of the
+Software, in whole or in part, for any purpose.
+
+PROHIBITED ACTIONS
+------------------
+Without the prior, express, written permission of the copyright holder,
+you may NOT:
+
+  (a) use the Software, in source or compiled form, for any purpose,
+      including but not limited to personal, academic, commercial,
+      research, training, evaluation, or benchmarking;
+
+  (b) copy, reproduce, mirror, fork, archive, or redistribute the
+      Software in any medium, in whole or in part;
+
+  (c) modify, adapt, translate, decompile, disassemble, reverse-engineer,
+      or create derivative works from the Software;
+
+  (d) host, deploy, run, serve, or make the Software available to any
+      third party, whether for a fee or free of charge;
+
+  (e) use the Software, its outputs, its weights, or any artifact derived
+      from it to train, fine-tune, evaluate, or benchmark any model
+      (statistical, machine-learning, or otherwise);
+
+  (f) remove, alter, or obscure any copyright, license, or attribution
+      notice contained in the Software;
+
+  (g) use the name, trademarks, or trade dress of the copyright holder
+      or any contributor to endorse or promote any product or service
+      derived from the Software.
+
+PERMITTED ACTIONS
+-----------------
+Notwithstanding the above, the copyright holder permits the following,
+solely to the extent strictly necessary to evaluate whether to seek a
+written license:
+
+  (i)  reading the source code for the purpose of personal evaluation
+       (no execution, no compilation, no copying beyond what occurs in
+       the routine operation of a web browser or git client viewing
+       this repository);
+
+  (ii) referencing publicly described architectural ideas in unrelated
+       academic discussion, provided that such discussion does not
+       reproduce code, weights, or proprietary algorithmic details
+       beyond what is necessary for citation.
+
+All other actions require a separate written agreement signed by the
+copyright holder.
+
+DATA AND MODEL WEIGHTS
+----------------------
+For the avoidance of doubt, this license covers BOTH the source code AND
+any data, model weights, training artifacts, evaluation reports, and
+inference outputs produced by the Software. Synthetic data, derived
+features, calibrators, ensemble outputs, and any artifact that embeds or
+is derived from the Software's algorithmic logic are all proprietary.
+
+THIRD-PARTY COMPONENTS
+----------------------
+This Software may incorporate third-party open-source libraries (FastAPI,
+LightGBM, scikit-learn, Next.js, etc.) which remain subject to their
+respective licenses. Those upstream licenses govern the third-party
+components only and do NOT extend any rights to this Software as a
+whole.
+
+NO WARRANTY
+-----------
+THE SOFTWARE IS PROVIDED "AS IS," WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+NO LIABILITY
+------------
+IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES,
+OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
+ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+GAMBLING / WAGERING DISCLAIMER
+------------------------------
+The Software is research code intended for academic paper-trading study
+of pari-mutuel wagering markets. It does NOT constitute financial,
+investment, or gambling advice. Outputs are NOT predictions of real-world
+race outcomes. The copyright holder makes no representation that use of
+the Software, its predictions, or its bet recommendations will result in
+profit, and explicitly disclaims any responsibility for losses incurred
+by any person who acts on the Software's outputs. Pari-mutuel wagering
+may be illegal in your jurisdiction; comply with all applicable laws.
+
+GOVERNING LAW
+-------------
+This license is governed by the laws of the State of New York, United
+States, without regard to its conflict-of-laws provisions. Any dispute
+arising out of or related to this license shall be subject to the
+exclusive jurisdiction of the state and federal courts located in
+New York County, New York.
+
+CONTACT
+-------
+For licensing inquiries, please contact the copyright holder via the
+issue tracker of this repository or the email address listed on the
+copyright holder's public profile.
+
+END OF LICENSE

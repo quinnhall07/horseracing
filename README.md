@@ -222,5 +222,8 @@ fixtures.
 
 ## License
 
-Proprietary — see `pyproject.toml`. University finance paper-trading
-competition only.
+Proprietary — **All Rights Reserved**. See [`LICENSE`](LICENSE) for the
+full text. In short: viewing the source for evaluation is permitted; any
+other use (execution, copying, modification, deployment, derivative works,
+or model training against this code or its outputs) requires written
+permission from the copyright holder.

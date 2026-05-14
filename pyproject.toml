@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Pari-mutuel wagering analytics system — PDF ingestion, ensemble ML, CVaR portfolio optimization."
 requires-python = ">=3.11"
 readme = "README.md"
-license = { text = "Proprietary" }
+license = { file = "LICENSE" }
 
 # Runtime dependencies for the PDF ingestion pipeline (Phase 1) and the
 # Phase 0 data pipeline (scripts/db/). Heavier ML deps (lightgbm, torch,
