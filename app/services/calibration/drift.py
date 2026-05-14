@@ -53,8 +53,11 @@ Public surface
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
@@ -308,10 +311,101 @@ def detect_drift(
     )
 
 
+# ── Drift-state persistence (ADR-044) ──────────────────────────────────────
+#
+# The rolling-retrain script (`scripts/rolling_retrain.py`) supports a
+# `--skip-if-no-drift` flag that reads a small JSON sidecar to decide
+# whether to spin up an expensive retraining run. We serialise just
+# enough of the `CUSUMDetector` state to make that check trivial:
+# `triggered`, the running sums, the observation count, and a UTC
+# timestamp of when the file was written. No predictions or labels are
+# persisted — the file is a marker, not an audit log.
+
+
+def save_drift_state(detector: "CUSUMDetector", path: Path) -> None:
+    """Persist the live CUSUM detector state to a JSON marker file.
+
+    Writes the keys consumed by `scripts/rolling_retrain.py`:
+        - triggered:       bool — has the alarm fired (latched once true)?
+        - pos_cusum:       float — current S+ running sum
+        - neg_cusum:       float — current S- running sum
+        - n_observations:  int — observations consumed so far
+        - alarmed_at:      Optional[int] — step at which the alarm fired
+        - direction:       Optional[str] — "high" / "low" when alarmed
+        - last_updated:    ISO-8601 UTC timestamp
+
+    Idempotent: writes the file atomically by truncating in place. Creates
+    parent dirs as needed. Safe to call from cron without locking — readers
+    only ever see a valid JSON document because of the os.replace semantics
+    of Path.write_text.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = detector.state
+    payload = {
+        "triggered": bool(state.alarmed),
+        "pos_cusum": float(state.s_plus),
+        "neg_cusum": float(state.s_minus),
+        "n_observations": int(state.n),
+        "alarmed_at": state.alarmed_at,
+        "direction": state.direction,
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "config": {
+            "k": detector.config.k,
+            "h": detector.config.h,
+            "two_sided": detector.config.two_sided,
+            "z_clip": detector.config.z_clip,
+            "eps": detector.config.eps,
+        },
+    }
+    path.write_text(json.dumps(payload, indent=2))
+    log.info("drift.state_saved", path=str(path), triggered=payload["triggered"],
+             n=payload["n_observations"])
+
+
+def load_drift_state(path: Path) -> dict:
+    """Read a JSON marker emitted by `save_drift_state`.
+
+    For a missing file returns a neutral "not triggered" state so the
+    `--skip-if-no-drift` flag on the rolling retrain script can fail
+    soft on first boot (no marker yet => no drift => skip). For a file
+    that fails to parse, returns the same neutral state with a logged
+    warning rather than raising — operator tooling should never crash
+    a cron job because of a corrupt marker.
+    """
+    path = Path(path)
+    if not path.exists():
+        log.info("drift.state_missing", path=str(path))
+        return {
+            "triggered": False,
+            "pos_cusum": 0.0,
+            "neg_cusum": 0.0,
+            "n_observations": 0,
+            "alarmed_at": None,
+            "direction": None,
+            "last_updated": None,
+        }
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        log.warning("drift.state_corrupt", path=str(path), error=str(exc))
+        return {
+            "triggered": False,
+            "pos_cusum": 0.0,
+            "neg_cusum": 0.0,
+            "n_observations": 0,
+            "alarmed_at": None,
+            "direction": None,
+            "last_updated": None,
+        }
+
+
 __all__ = [
     "CUSUMConfig",
     "CUSUMDetector",
     "CUSUMState",
     "DriftReport",
     "detect_drift",
+    "save_drift_state",
+    "load_drift_state",
 ]
