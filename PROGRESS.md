@@ -7,9 +7,48 @@ Format: newest session at the top.
 
 ## Current State
 
-**Phase:** Phase 8 **COMPLETE** — real ensemble trained on a 2.6M-row real-data parquet; 5-of-5 sub-models trainable; provenance plumbing live.
-**Last completed task (Phase 8):** Full bootstrap finished in 28 min on `models/baseline_full/` against `data/exports/training_20260513.parquet` (2,623,587 rows · 263,209 horses · 1986-2023). **All 5 sub-models trained:** Speed/Form val AUC 0.740 · Sequence val AUC 0.710 · Pace train AUC 0.874 (no val — HK rows are all in the time-sorted train slice) · Connections (1,835 jockeys / 2,343 trainers / 38,221 pairs) · Market. **Meta-learner test ECE 0.00662 · test Brier 0.0722 · test log-loss 0.260 · top-1 race accuracy 31.9%.** Calibrator auto-selected `identity` (Brier-co-criterion guard — calibration would not have improved the strictly-proper score, per ADR-038). **`BOOTSTRAP_PROVENANCE.json` records `is_synthetic=false`, all 5 sub-models in `sub_models`, empty `stub_sub_models`.** `InferenceArtifacts.load("models/baseline_full")` succeeds and the API responses now carry `model_provenance` — the `ProvenanceBanner` component will stay hidden (no synthetic warning, no stub list). **682 tests passing** (was 652 → +30: 7 provenance + 11 sequence + 12 pace). Frontend build clean.
-**Next task:** Commit the session. The 3 still-403 Kaggle slugs (joebeachcapital US, zygmunt UK, gdaley HK-original) remain blocked behind their terms-acceptance flow — joebeachcapital is the highest-value unblock (US data with frac1/frac2 mapping; would broaden Pace beyond HK-only). The two user-supplied datasets we DID NOT integrate were `zygmunt/horse-racing-dataset` (needs a new csv-directory preprocessor + field-map rewrite — schema diverges from current zygmunt field map) and an unidentified `HorseRacing.csv` (UK derived-stats; not in field-map registry). Long-term: ADR-047 option (b) (synthetic pace proxy for non-HK rows) if Pace's meta-learner contribution turns out narrow on a bigger jurisdiction mix.
+**Phase:** Phase 9 **COMPLETE** — OCR pipeline + LLM-based parser for scanned PDFs. Site is structurally bootable end-to-end.
+**Last completed task (Phase 9 + session wrap):**
+* `_extract_with_ocr` added to the PDF extractor: pypdf direct-image extraction first (~4 s/page on iOS scans because we OCR the embedded JPGs directly), then `pdf2image`/Poppler raster fallback at 200 DPI for vector-content PDFs. Tesseract (`pytesseract>=0.3`) does the OCR. Per-page text joined with `\x0c` form-feed so the downstream cleaner / format detector / parser see an identical interface. Per-page error isolation — a single Tesseract crash doesn't kill the whole document. **All 3 `EXAMPLE_RACE_CARDS/*.pdf` files now extract OCR text in 7-10 s each, up from "PDF produced no extractable text" hard-fail.** ADR-048.
+* `LLMParser` (`app/services/pdf_parser/llm_parser.py`) uses `claude-haiku-4-5-20251001` (override via constructor) with prompt caching on the system + field-spec primer. JSON contract enforced via strict prompt + 3-tier JSON-extraction fallback. Lazy `anthropic` import; missing-SDK or missing-`ANTHROPIC_API_KEY` returns an empty `ParsedResult` with a warning rather than crashing. `extractor.ingest_pdf` invokes the LLM fallback when the regex parser yields 0 qualified races, tags `RaceCard.source_format` with `+llm` as provenance. ADR-049.
+* Defensive distance clamp `2.0 ≤ distance ≤ 20.0` in `BrisnetParser._build_header` so OCR-noisy "5000 furlongs" reads skip the race rather than abort the parse with a Pydantic ValidationError.
+* `pyproject.toml` adds `pdf2image>=1.16,<2.0` + `pytesseract>=0.3,<1.0` as required deps + `[project.optional-dependencies].llm-parse = ["anthropic>=0.40"]`. System binaries (`tesseract`, `poppler`) installed via Homebrew this session.
+* **739 tests passing** (was 691 → +48: 9 OCR + 39 LLM-parser). Frontend build unchanged. Commits this session: `f195c62` (Phase 8 — real ensemble), `397aad5` (Phase 9 — OCR + LLM parser).
+**Next task — pick this up in a fresh session:** **Verify the LLM parser end-to-end on a real upload.** Set `ANTHROPIC_API_KEY` in the env, restart the API (see "Booting the site" below), upload one of `EXAMPLE_RACE_CARDS/Race 4.pdf` / `Race 5.pdf` / `Race 9.pdf` through the frontend at http://127.0.0.1:3000/, confirm: (a) `model_provenance.is_synthetic=false` on the card response, (b) the LLM extracts 4–8 horses per race with names + ML odds + at least a few PP lines each, (c) the pareto endpoint returns 4–6 non-empty risk levels with `n_candidates_total > 0`. The mock-based test suite already verifies the wiring; only the **real API call** behaviour remains unverified (this session left it at the user's discretion to spend the ~$0.005/card).
+
+### Booting the site (handoff)
+
+Both servers shut down at session end — to bring them back:
+
+```bash
+# 1. (one-time) Confirm system deps are present:
+which tesseract pdftoppm        # expect /opt/homebrew/bin/* on macOS
+
+# 2. (one-time) Set the Anthropic key for LLM-based PDF parsing:
+export ANTHROPIC_API_KEY="sk-ant-..."         # or add to ~/.zshenv / ~/.zshrc
+
+# 3. Start backend (loads the real trained ensemble):
+HRBS_MODELS_DIR=models/baseline_full \
+HRBS_DATABASE_URL='sqlite+aiosqlite:///./hrbs_live.db' \
+.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+# logs: /tmp/hrbs_api.log; OpenAPI: http://127.0.0.1:8000/openapi.json
+
+# 4. Start frontend (Next.js dev):
+npm --prefix frontend run dev &
+# logs: /tmp/hrbs_web.log; URL: http://127.0.0.1:3000/
+```
+
+`frontend/.env.local` is already set to `NEXT_PUBLIC_API_BASE=http://localhost:8000` + `NEXT_PUBLIC_MOCK_API=false`. The `ProvenanceBanner` component will stay hidden against `models/baseline_full/` because `BOOTSTRAP_PROVENANCE.json` reports `is_synthetic=false` and `stub_sub_models=[]`.
+
+### Open queue (in priority order, for whichever session picks this up)
+
+1. **Real-API smoke on the LLM parser** — see "Next task" above. Smallest unit of remaining Phase 9 work.
+2. **Three Kaggle slugs still 403** — `joebeachcapital/horse-racing` (US — highest value: only slug in the field-map registry that maps `frac1`/`frac2` outside HK, so its data would broaden Pace beyond HK-only), `zygmunt/horse-racing-dataset`, `gdaley/horseracing-in-hk` via the API path. Require a one-time terms-acceptance click in the browser. Once accepted, `scripts/run_phase0_pipeline.sh` picks them up.
+3. **Zygmunt csv-directory ingest** — user-staged copy from Phase 8 needs a new preprocessor (~50 LOC) + field-map rewrite to match `horses_YYYY.csv` + `races_YYYY.csv` + `forward.csv` layout (current zygmunt field-map expects a single denormalized CSV; doesn't match the actual archive shape).
+4. **HorseRacing.csv** — unidentified UK derived-stats dataset the user dropped in `data/imported dbs/`. Probably `hwaitt/horse-racing`. Adding it would mean writing a new field-map (24 MB CSV with ~250 columns, many redundant with what `prepare_training_features` derives).
+5. **OCR quality on regex parser** (deferred by ADR-049) — Brisnet regex parser stays the fast path for text-layer PDFs; OCR-noisy text routes to LLM. If the user's scans get cleaner (or someone implements a layout-restoration preprocessor), regex might become viable on OCR text and save the API spend.
+6. **ADR-047 option (b)** — synthetic pace proxy for non-HK rows. Only needed if Pace's meta-learner gain attribution turns out narrow once a broader-jurisdiction mix (e.g., joebeachcapital US) is in the parquet.
+7. **Rolling-retrain on real data** — `scripts/rolling_retrain.py` is wired but never exercised against the v2 parquet. A scheduled run (drift-triggered via `--skip-if-no-drift`) is the natural cadence-test.
 
 ### Phase 8 session log — 2026-05-13
 
