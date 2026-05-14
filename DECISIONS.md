@@ -1931,3 +1931,118 @@ A follow-up should swap it for `app.services.portfolio.optimizer.optimize_portfo
 — the interface (`list[BetCandidate] → Portfolio`) matches, so this is a
 one-line replacement inside `analyze_card`. Endpoint signatures and tests
 do not need to change.
+
+---
+
+## ADR-043: Feedback Loop — Outcomes Logging + Portfolio-Level CUSUM Drift
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+**Context:**
+Master Reference §4 Layer 7 ("Feedback + Online Learning") requires a
+persisted record of what actually happened on every race we bet, plus an
+online drift detector that watches realised vs. expected portfolio
+performance. Without this loop the model can silently miscalibrate for
+weeks before we notice via P&L alone. Phase 4 already shipped a calibration-
+residual CUSUM (`app/services/calibration/drift.py`, ADR-036) but at the
+single-event prediction level — we still needed the portfolio-level analogue.
+
+**Decision:**
+
+1.  **Two new ORM tables in `app/db/models.py`:**
+
+    `RaceOutcome` — official chart / manual result for one race.
+        Idempotency anchor: `race_dedup_key` (UniqueConstraint). Same
+        SHA-256 race-key convention as the Phase 0 master DB so manual
+        entries and downstream official-chart imports collapse to one row.
+
+    `BetSettlement` — one row per settled `BetRecommendation`. Stores both
+        recommendation-time and settlement-time decimal odds so future drift
+        attribution can split realised error into "model error" vs.
+        "market move" components. No FK from `BetSettlement` to a
+        recommendations table yet — `bet_recommendation_id` is a nullable
+        slot reserved for when Stream A persists recommendations.
+
+2.  **PnL convention (`pnl = payout − stake`):**
+    * Lose: payout = 0  → pnl = −stake (always negative).
+    * Win:  payout = stake · decimal_odds_at_settlement → pnl = stake · (odds − 1).
+
+    Convention chosen so that "expected_value" (already a per-unit-stake
+    number in `BetCandidate.expected_value`) and realised pnl live in the
+    same units (dollar P&L on the stake), making the drift z-score
+    straightforward: z_i = (pnl_i − E[pnl_i]) / σ_i.
+
+3.  **Portfolio CUSUM — same defaults as calibration drift (k=0.5, h=4):**
+
+    One set of σ-unit thresholds across every drift detector in the system
+    keeps the operator's mental model simple. ARL₀ ≈ 168 (per Hawkins &
+    Olwell 1998) is the same in-control regime the calibration detector
+    accepts, and switching to h=6 (ARL₀ ≈ 1290) for noisier streams is a
+    one-line config change.
+
+    Per-bet z-score:
+        σ_i = stake_i · √(p_i(1 − p_i)) · decimal_odds_at_settlement_i
+        z_i = (pnl_i − E[pnl_i]) / σ_i
+
+    The variance proxy is the Bernoulli closed-form stdev of (pnl | bet placed),
+    which is correct for win-or-lose bets and reduces to `|stake|` as a
+    conservative fallback when prob/odds are unavailable.
+
+4.  **Two-sided alarms — both directions matter:**
+    * `s_plus` crossing h  → realised exceeded expected (model under-
+      confident OR a variance burst on the upside). Operationally:
+      review whether stakes should be enlarged.
+    * `s_minus` crossing h → realised under expected (model over-confident,
+      the canonical drift failure). Operationally: trigger retrain /
+      recalibration.
+
+    Both directions latch (no re-fire after `triggered=True` until
+    `reset()` is called) — matches the calibration drift behaviour.
+
+5.  **Settlement scope = Phase 5a / ADR-039 bet types only.**
+    Only WIN/EXACTA/TRIFECTA/SUPERFECTA are settleable. PLACE/SHOW/PICK-n
+    raise `ValueError` so a future caller does not silently produce
+    wrong settlements. Phase 5a's `BetCandidate` validator already
+    enforces this at construction time; `settle_bets` carries a
+    redundant guard for callers using `model_construct` bypasses.
+
+**Rationale:**
+- **Idempotency on `race_dedup_key`**: matches the Phase 0 dedup contract
+  ("running twice on the same source produces the same DB state").
+  Allows manual entry, official chart, and Equibase scrape to all target
+  the same row without collision logic.
+- **CUSUM-z over Bayesian change point / rolling-mean-test**: same
+  rationale as ADR-036 (the calibration drift ADR). Bayesian CPs add a
+  prior we cannot defend ("how often do we EXPECT the model to drift?")
+  and rolling-mean t-tests have terrible ARL behaviour on streams with
+  serial correlation. CUSUM is the standard for online change-point on
+  streamed Bernoulli-derived residuals.
+- **Two redundant decimal-odds snapshots** (recommendation-time +
+  settlement-time): per-step they look identical (no live tote yet),
+  but the second slot is the future-proof hook for when live odds land.
+  Cheap to populate, expensive to retrofit if omitted.
+
+**Rejected Alternatives:**
+- One unified `outcomes_and_bets` table — rejected; outcomes are
+  immutable race-level facts (one row per race), settlements are
+  per-bet, and one race has 0..N settlements. Two tables keep the
+  cardinalities clean.
+- Bayesian online change-point detection (BOCPD) — rejected for v1
+  (same reasoning as ADR-036). Worth revisiting if the operator wants
+  posterior probabilities of drift rather than alarms.
+- Mean-of-residual t-test in a rolling window — rejected; ignores serial
+  correlation in race-to-race PnL and has unstable ARL.
+- Storing pnl as `stake · (decimal_odds − 1)` directly for both win and
+  loss cases (i.e. negative profit when loss) — equivalent to the chosen
+  convention, but `pnl = payout − stake` is more explicit and reads off
+  the BetSettlement row without computing intermediate "edge" numbers.
+
+**Open follow-ups:**
+- `BetSettlement.bet_recommendation_id` is currently nullable. When
+  Stream A adds a `BetRecommendation` table, retrofit a non-null FK
+  via a follow-up migration.
+- The Bernoulli-σ in `portfolio_pnl_zscore` is single-event; for
+  correlated baskets (e.g. exotic permutations within the same race)
+  we would replace with a copula-derived σ. Out of scope for Layer 7
+  but flagged here for Phase 6+.
