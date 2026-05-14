@@ -29,23 +29,27 @@ npm run dev                  # http://localhost:3000
 | Path | Page |
 |---|---|
 | `/` | PDF upload landing with demo-mode fallback |
-| `/card/[id]` | Race card viewer — sticky header, race tabs, horse table, EV gauge |
-| `/card/[id]/portfolio` | Bet execution ticket — risk strip + recommendations |
+| `/card/[id]` | Unified result view — bankroll input, pareto risk/return curve, risk slider, bet ticket that updates as the user slides along the curve, expandable race-detail accordions |
+| `/card/[id]/portfolio` | Redirects to `/card/[id]#races` for legacy bookmarks |
+
+The user flow: upload a PDF → parser extracts the card → the backend's
+inference pipeline scores every horse → the optimiser solves 6 portfolios at
+6 risk levels → frontend renders the frontier. Click any point on the curve
+(or press a stop on the slider) to switch the bet ticket in place.
 
 ## Backend contracts (consumed)
 
-- `POST /api/v1/ingest/upload` → `IngestionResult` — already implemented (`app/api/v1/ingest.py`).
-- `GET /api/v1/cards/{card_id}` → `RaceCard` — **not yet implemented**. Mock mode covers it.
-- `GET /api/v1/portfolio/{card_id}` → `Portfolio` — **not yet implemented**. Mock mode covers it.
+- `POST /api/v1/ingest/upload` → `IngestionResult` — Stream A.
+- `GET /api/v1/cards/{card_id}` → `RaceCard` (with hydrated `model_prob` /
+  `market_prob` / `edge` per `HorseEntry`) — Stream A.
+- `GET /api/v1/portfolio/{card_id}` → `Portfolio` (single-risk-level
+  aggregated card portfolio) — Stream A.
+- `GET /api/v1/portfolio/{card_id}/pareto?risk_levels=…` → `ParetoFrontier`
+  (6 Portfolios at distinct CVaR drawdown caps) — Stream X (ADR-045).
 
-When wiring up the real endpoints, see `lib/types.ts` for the exact JSON
-shape the frontend expects. The interfaces mirror the Pydantic v2 schemas
-in `app/schemas/race.py` and `app/schemas/bets.py` field-for-field, with
-two UI-only extensions on `HorseEntry`:
-
-- `program_number`, `model_prob`, `market_prob`, `edge` — populated by
-  whatever endpoint hydrates calibrated probabilities (likely `/analyze` once
-  it exists).
+All four endpoints are live as of the current main branch. The interfaces
+in `lib/types.ts` mirror the Pydantic v2 schemas in `app/schemas/race.py` and
+`app/schemas/bets.py` field-for-field.
 
 ## Local commands
 
@@ -62,10 +66,14 @@ With `NEXT_PUBLIC_MOCK_API=true`:
 
 - Upload accepts any file (or click "load a synthetic demo card") and returns
   the seeded 9-race Churchill Downs card from `lib/mock.ts`.
-- `/card/[id]` and `/card/[id]/portfolio` both work end-to-end with no
-  backend running.
-- Probabilities, edges, and the 6-bet portfolio are deterministic (seeded
-  PRNG), so screenshots stay stable across refreshes.
+- `/card/[id]` renders the full pareto-driven view with deterministic
+  fake data — 6 frontier points monotone in (risk, return), 6 BetRecommendations
+  total spread across the points.
+- Probabilities, edges, and stake fractions are deterministic (seeded PRNG),
+  so screenshots stay stable across refreshes.
+
+`NEXT_PUBLIC_MOCK_API` defaults to `false` in `.env.example` — flip it to
+`true` for frontend-only iteration.
 
 ## Design
 
