@@ -49,6 +49,21 @@ def _models_dir() -> Path:
     return Path(raw)
 
 
+def _cors_origins() -> list[str]:
+    """CORS allow-list.
+
+    `HRBS_CORS_ORIGINS` is a comma-separated list of origins. Use `*` for
+    permissive dev. In production deploys (e.g. Vercel frontend + Fly.io
+    backend on different domains), set to your specific Vercel URL(s):
+
+        HRBS_CORS_ORIGINS=https://your-app.vercel.app,https://staging.your-app.vercel.app
+    """
+    raw = os.environ.get("HRBS_CORS_ORIGINS", "*").strip()
+    if raw == "*" or not raw:
+        return ["*"]
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
@@ -112,11 +127,12 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    origins = _cors_origins()
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["*"],
+        allow_origins=origins,
+        allow_credentials=(origins != ["*"]),
+        allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
 

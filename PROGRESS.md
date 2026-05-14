@@ -7,9 +7,9 @@ Format: newest session at the top.
 
 ## Current State
 
-**Phase:** Phases 0-6 **COMPLETE** · Master Reference Layer 7 (feedback / online learning) **COMPLETE** · Cards + Portfolio API endpoints **LIVE** (frontend can leave MOCK mode).
+**Phase:** Phases 0-6 **COMPLETE** · Master Reference Layer 7 **COMPLETE** · Cards + Portfolio API endpoints **LIVE** · Pareto-frontier endpoint + frontend rebuild **LIVE** · Public-ready + Vercel-deployable.
 **Last completed task:** Three parallel worktree streams (A/B/C) merged into `main` in a single integration pass. **Stream A** built `app/services/inference/pipeline.py` (RaceCard → calibrated win probs → EV candidates → interim portfolio) plus `GET /api/v1/cards/{id}` (hydrates `model_prob`/`market_prob`/`edge` on each `HorseEntry`) and `GET /api/v1/portfolio/{id}` (aggregates per-race Portfolios into one card-level Portfolio). Lifespan-loads `InferenceArtifacts` from `models/baseline_full/`; missing-models case returns 503. Card persistence via existing live ingestion DB. **Stream B** added `RaceOutcome` and `BetSettlement` ORM tables (idempotent on `race_dedup_key`), `app/services/feedback/{outcomes,portfolio_drift}.py` with a two-sided CUSUM (k=0.5, h=4 — same defaults as Phase 4 calibration drift, ADR-036). **Stream C** added `scripts/rolling_retrain.py` (3-year half-open window default, drift-triggered via `--skip-if-no-drift` reading a JSON marker, standalone-script execution per CLAUDE.md §11) + `save_drift_state` / `load_drift_state` helpers on `app/services/calibration/drift.py`. **ADRs 042, 043, 044** appended. **623 tests passing** (was 557 → +66: 13 inference + 21 outcomes + 22 portfolio drift + 10 rolling retrain). The 10 new API endpoint tests also pass (`pytest tests/test_api/test_cards.py tests/test_api/test_portfolio.py`). Frontend build remains clean.
-**Next task:** Carry-forward items (see "Open follow-ups" below) — most material: swap the interim portfolio constructor in `app/services/inference/pipeline.py::build_portfolio_from_candidates` for the Phase 5b Rockafellar-Uryasev LP `optimize_portfolio` (one-line replacement; interface matches). Then point the frontend at the running API by setting `NEXT_PUBLIC_MOCK_API=false`.
+**Next task:** Push to a GitHub remote, deploy the frontend to Vercel (Root Directory = `frontend/`, set `NEXT_PUBLIC_API_BASE` + `NEXT_PUBLIC_MOCK_API` env vars), deploy the backend to Fly.io / Railway / Render. Long-term: train Pace + Sequence sub-models out of their ADR-026 stubs, optionally rewrite the proprietary license depending on the public-release plan.
 
 ### Phase 5a smoke result — flagged for Phase 5b investigation
 
@@ -102,7 +102,129 @@ JP carries 1.6M rows with no speed figure. Either derive a synthetic speed figur
 
 ## Session Log
 
-### Session: 2026-05-13 (e) — Streams A/B/C: inference API + outcomes/drift + rolling retrain (3 parallel worktree agents)
+### Session: 2026-05-13 (g) — Repo hygiene + Vercel deployment readiness
+
+**Completed:**
+
+Pre-public polish. Goal: a clean clone can be pushed to GitHub and deployed to Vercel with one repo-import + a Root-Directory click.
+
+*Hygiene*
+- Deleted stray runtime SQLite artifacts (`_test_cards_*.db`, `horseracing.db`) from the repo root. They were always gitignored but cluttered the working tree.
+- Untracked the regenerable model artifacts (`models/baseline_full/{speed_form,connections,market,meta_learner}/...`, `summary.json`, calibrator metadata). `quick_bootstrap.py` outputs are non-deterministic across LightGBM/numpy version drift, so committing them was fragile. Smoke reports (`ev_engine/*/report.json`) and historical calibration outputs (`calibration*/reliability.png`, `report.json`, `summary.json`) remain tracked as validation evidence.
+- Extended `.gitignore` with `models/baseline_full/<sub_model>/` paths, `models/rolling/`, `.vercel/`, `.next/`, `node_modules/`, `*.tsbuildinfo`, `next-env.d.ts`, `.env.*.local`, `secrets.json`, `*.pem`, and `.claude/worktrees/`.
+- Added `.editorconfig` (4-space Python, 2-space TS/JSON/MD, LF endings).
+- Added `frontend/.nvmrc` pinning Node 20.
+
+*CORS & env-driven config*
+- `app/main.py` gained `_cors_origins()` reading `HRBS_CORS_ORIGINS` (comma-separated; default `*`). When a specific origin list is set, `allow_credentials` flips to `True` so cookie-based auth would work cross-origin. Restricted methods to `GET, POST, OPTIONS` (the surface the frontend actually uses).
+- `.env.example` documents the new `HRBS_CORS_ORIGINS` and `HRBS_MODELS_DIR` variables.
+
+*Vercel*
+- `frontend/vercel.json` declares Next.js framework + build/install commands and a small set of security headers (`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy`, restrictive `Permissions-Policy`). `regions: ["iad1"]` keeps cold starts on the US east coast where most racing tracks live.
+- No top-level `vercel.json` — the canonical monorepo deploy path is "set Root Directory to `frontend/` in the Vercel UI". Tried wrapping with a root `cd frontend && ...` build command but that fights Next.js auto-detect.
+
+*CI*
+- `.github/workflows/ci.yml` runs the backend matrix (py 3.11 / 3.12 / 3.13, `pytest tests/ -q`) and the frontend (Node 20, `typecheck` + `lint` + `build` with `NEXT_PUBLIC_MOCK_API=true` so the mock path is exercised in CI without a backend). `concurrency` cancels in-progress runs on rapid push.
+
+*Documentation*
+- `README.md` gained a comprehensive **Deployment** section: Vercel walkthrough (Root Directory = `frontend/`, env-var checklist), backend-host recommendations (Fly.io / Railway / Render with rationale for why Vercel serverless doesn't fit a model-loading stateful FastAPI app), CORS guidance. Tightened the Configuration table to include `HRBS_CORS_ORIGINS`.
+- `PROGRESS.md` (this entry) + Current State header now reflect public-ready + Vercel-deployable state.
+
+**Tests Status:**
+- All **652 tests passing** (`pytest tests/ -q`) — no changes to test count.
+- Frontend `npm run typecheck` ✅ — zero errors.
+- Frontend `npm run lint` ✅ — zero warnings.
+- Frontend `npm run build` ✅ — 4 routes, same JS sizes as before.
+- `python scripts/quick_bootstrap.py` ✅ — `InferenceArtifacts.load(...)` succeeded after the run.
+
+**Files touched this session:**
+- `.gitignore` (+15 lines) — Vercel, Node, secrets, model artifacts.
+- `.editorconfig` (new, 20 lines).
+- `.github/workflows/ci.yml` (new, 65 lines).
+- `frontend/vercel.json` (new, 22 lines).
+- `frontend/.nvmrc` (new, 1 line).
+- `app/main.py` (+15 lines) — `_cors_origins()` + tightened middleware.
+- `.env.example` (+11 lines) — CORS + models-dir docs.
+- `README.md` (+~70 lines) — Deployment section.
+
+**Untracked from git (no content change, only the tracking status):**
+- `models/baseline_full/{connections,market,meta_learner,speed_form}/...`
+- `models/baseline_full/summary.json`
+- `models/baseline_full/calibration_adr038_brier/meta_learner/metadata.json`
+
+**Open follow-ups (for the first real deploy):**
+
+1. **Pick a license.** `pyproject.toml` says "Proprietary" but the user has indicated this is going public. A `LICENSE` file (MIT, Apache-2.0, BSL, or explicit proprietary text) should land before the repo goes public.
+2. **Real-data bootstrap.** Production deploy needs actual Kaggle data → `scripts/db/*` → `scripts/bootstrap_models.py`. The `quick_bootstrap.py` placeholder serves the demo but its predictions are not meaningful.
+3. **Backend host selection.** README documents Fly.io / Railway / Render as candidates. Pick one, wire the deploy command, set `HRBS_CORS_ORIGINS` to the Vercel URL.
+4. **Train Pace + Sequence sub-models.** Still ADR-026 stubs; the loader is tolerant but ensemble quality is 3-of-5.
+
+---
+
+### Session: 2026-05-13 (f) — Pareto frontier endpoint + frontend rebuild (Streams X/Y/Z)
+
+**Completed:**
+
+Three parallel worktree agents dispatched, each completing ~1/3 of their scope before hitting a rate-limit. Their partial commits were merged into `main`, the remaining ~2/3 of each stream was finished directly in the main session, and the result is a pareto-driven UX from upload to bet ticket.
+
+*Stream X — Pareto endpoint + LP swap + greenlet fix*
+- Swapped the interim portfolio constructor in `app/services/inference/pipeline.py::analyze_card` for Phase 5b's Rockafellar-Uryasev LP (`app/services/portfolio/optimizer.optimize_portfolio`). The interim (`build_portfolio_from_candidates`) is preserved behind `use_interim=True` for backward-compat.
+- New `analyze_card_pareto(card, artifacts, *, risk_levels, ...)` — runs candidate generation ONCE, re-solves only the per-race LP at each risk level. For a 10-race card × 6 risk levels: 1 ML pass + 60 cheap LP solves.
+- New schemas `ParetoPoint` + `ParetoFrontier` in `app/schemas/bets.py`.
+- New endpoint `GET /api/v1/portfolio/{card_id}/pareto?risk_levels=…` — comma-separated risk levels (1–12, each in (0, 1], strictly increasing after parse; default `0.05,0.10,0.15,0.20,0.25,0.30`). Returns a card-aggregated Portfolio per risk level. Same auth/error semantics as `/portfolio/{id}`.
+- Pinned `greenlet>=3.0` explicitly in `pyproject.toml` — sqlalchemy[asyncio]'s wheel resolution drops it on py3.13/3.14 sometimes.
+- **+7 endpoint tests** in `tests/test_api/test_pareto.py` (503/404/default-returns-6/monotone-in-return/custom-risk-levels/malformed-400/unit-pipeline). **652 total tests passing.**
+
+*Stream Y — Quick bootstrap + README*
+- `scripts/quick_bootstrap.py` (~540 lines): generates 4000 rows of synthetic training data with a planted weak signal (~0.15 correlation between `field_relative_speed`/`jockey_trainer_interaction` and `won`), time-splits 60/20/20, trains Speed/Form + Connections + Market + Meta-learner + Calibrator (skips Pace/Sequence per ADR-026 stub policy), writes the full bundle to `models/baseline_full/` in ~1.3 s. Verification step at the end loads the bundle via `InferenceArtifacts.load()` and asserts it succeeds.
+- Marker file `models/baseline_full/QUICK_BOOTSTRAP.json` carries `is_synthetic: true` so future tooling can detect placeholder bundles.
+- `README.md` (new): real human-facing quickstart (clean clone → venv → pip → bootstrap → uvicorn → npm dev → upload an example PDF). Plus Real-data path, Architecture, Running tests, Configuration, Project layout, Non-negotiable constraints (linked to ADRs), Troubleshooting.
+- `frontend/.env.example` flipped `NEXT_PUBLIC_MOCK_API` default from `true` to `false` — clean dev now hits the real API.
+
+*Stream Z — Frontend rebuild around pareto*
+- `frontend/lib/types.ts`: added `ParetoPoint` + `ParetoFrontier` mirroring the backend schemas.
+- `frontend/lib/api.ts`: added `getParetoFrontier(cardId, options)` typed wrapper with full query-param coverage and a MOCK fallback.
+- `frontend/lib/mock.ts`: added `mockParetoFrontier(...)` producing 6 deterministic points monotone in (risk, return) with realistic stake fractions (all ≤ 0.03 per ADR-002).
+- Two new components:
+  - `components/ParetoCurve/ParetoCurve.tsx` — Recharts `ComposedChart` (Scatter + Line overlay), custom dot renderer that grows + colours the selected point, custom tooltip, clickable points.
+  - `components/ParetoCurve/RiskSlider.tsx` — six labelled stepped buttons (`conservative / moderate / balanced / aggressive / max risk`), synchronised with the curve via shared parent state.
+- `frontend/app/card/[id]/page.tsx` rebuilt as a unified result view: sticky header with bankroll input (debounced 400 ms, triggers pareto re-fetch), pareto curve + risk slider side-by-side, portfolio summary strip (6 stats), bet ticket that updates in-place when the user picks a point, expandable race-detail accordions (showing horse table per race with recommendation count badges).
+- `frontend/app/card/[id]/portfolio/page.tsx` reduced to a server-side `redirect` back to `/card/{id}#races` for any legacy bookmarks.
+- `frontend/README.md` updated with the new URL structure + backend contract surface.
+- `npm run build` ✅ — 4 routes, 0 TS errors, `/card/[id]` JS bundle 112 kB First Load (was 101 kB pre-pareto — the new components add ~11 kB).
+
+**Key decisions made (new ADR):**
+
+- **ADR-045:** Real R-U LP in `analyze_card` + new pareto endpoint + risk-grid default (6 levels from 0.05 to 0.30). Per-call cost dominated by `n_risk_levels × n_races` LP solves (~50 ms each, well under 5 s on a typical 8-race card × 6 levels). Returning the full Portfolio per point (not just summary stats) so the frontend slider transitions are zero-fetch.
+
+**Tests Status:**
+- Pre-session: 626 passing (the post-Streams-A/B/C state — 623 backend + 10 API tests counted separately).
+- Stream X: +7 pareto endpoint tests + 13 inference-pipeline tests already accounted for.
+- **Final: 652 passing** at `pytest tests/ -q` in ~11 s. No regressions.
+
+**Surprising / non-obvious findings:**
+
+- **All three parallel agents branched from `d425b30` (pre-Phase-5b)** even though main was `de15078` at dispatch time. Their DECISIONS.md ADRs all collided at "next-available number = 041". Streams Y and Z got `add/add` conflicts on frontend/lib/{types,api,mock}.ts during merge (their version vs. main's existing Phase 6 baseline) — resolved by keeping main's version and inserting Stream Z's pareto additions inline. Same lesson as Streams A/B/C (one round earlier): worktree base race conditions are real; ADR slots should be pre-assigned in the agent briefs and frontmatter conflicts must be resolved explicitly.
+- **The pareto curve must be monotone non-decreasing in expected_return** as risk loosens, because higher `max_drawdown_pct` is a strictly looser constraint on the same LP. The test `test_pareto_monotone_in_expected_return` exercises this invariant — if it ever fails, the LP setup has a sign error or the candidate generation isn't deterministic.
+- **`analyze_card(optimize=False)` was already structured perfectly** for the pareto re-use: it returns `(race_win_probs, all_candidates, [])` so the pareto function just groups candidates by race, then loops the optimizer per risk level. No refactor of the heavy inference path was needed.
+
+**Files created/modified this session (after the 3 partial agent merges):**
+- `app/schemas/bets.py` (+27 lines) — ParetoPoint, ParetoFrontier schemas.
+- `app/services/inference/pipeline.py` (+140 lines) — `analyze_card_pareto`, `_aggregate_per_race_portfolios`, `DEFAULT_RISK_LEVELS` constant, updated `__all__`.
+- `app/api/v1/portfolio.py` (+140 lines) — pareto route + `_parse_risk_levels` + `_run_pareto_sync` executor wrapper.
+- `tests/test_api/test_pareto.py` (new, 7 tests).
+- `DECISIONS.md` (+~75 lines) — ADR-045.
+- `README.md` (new) — full operator quickstart.
+- `frontend/.env.example` — MOCK default flip.
+- `frontend/lib/{types,api,mock}.ts` — pareto types + client + mock data (from Stream Z partial).
+- `frontend/components/ParetoCurve/{ParetoCurve,RiskSlider}.tsx` (new, ~250 lines combined).
+- `frontend/app/card/[id]/page.tsx` (rebuilt, 290 lines).
+- `frontend/app/card/[id]/portfolio/page.tsx` (reduced to a 16-line redirect).
+- `frontend/README.md` (updated URL structure + backend contracts).
+
+---
+
+
 
 **Completed:**
 

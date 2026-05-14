@@ -93,19 +93,85 @@ calibration, EV engine, portfolio optimizer, pareto frontier, inference
 pipeline, outcomes logging, drift detection, and rolling-retrain script.
 Frontend tests are out of scope; visual verification happens via `npm run dev`.
 
+GitHub Actions runs the backend matrix (py 3.11 / 3.12 / 3.13) and the frontend
+`typecheck` + `lint` + `build` on every push and PR — see
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+## Deployment
+
+### Frontend → Vercel
+
+The frontend is a stock Next.js 14 App Router app; deploys to Vercel with zero
+custom server code.
+
+1. Push the repo to GitHub.
+2. Vercel → "Import Project" → connect your GitHub account → select this repo.
+3. In the Vercel project settings, set **Root Directory** to `frontend/`.
+   Framework auto-detects as Next.js; build / output / install commands come
+   from [`frontend/vercel.json`](frontend/vercel.json).
+4. Set the following environment variables in Vercel (Settings → Environment
+   Variables):
+
+   | Variable | Value | Purpose |
+   |---|---|---|
+   | `NEXT_PUBLIC_API_BASE` | `https://your-backend.example.com` | Backend origin |
+   | `NEXT_PUBLIC_MOCK_API` | `false` (or `true` for backendless demo) | Toggle live API vs. seeded mocks |
+
+5. Deploy. The first build is ~90 s; subsequent pushes to `main` redeploy
+   automatically.
+
+The frontend works standalone with `NEXT_PUBLIC_MOCK_API=true` if you want a
+public demo without a hosted backend — `lib/mock.ts` ships a seeded Churchill
+Downs card and a hand-tuned pareto frontier so the UI exercises every component.
+
+### Backend → not Vercel
+
+The FastAPI backend loads ML artifacts at startup, holds a process-local
+inference cache, and uses SQLAlchemy async sessions. None of that maps well to
+serverless function platforms. Recommended hosts:
+
+- **[Fly.io](https://fly.io)** — `fly launch` on the repo root, point at
+  `app.main:app`. Persistent volume for the SQLite DB; the included
+  `pyproject.toml` is enough for `pip install -e .`.
+- **[Railway](https://railway.app)** — connect repo, set start command
+  `uvicorn app.main:app --host 0.0.0.0 --port $PORT`.
+- **[Render](https://render.com)** — same pattern, Render auto-detects Python
+  from `pyproject.toml`.
+
+Whichever you pick, the deploy script must run `scripts/quick_bootstrap.py`
+(or a real `scripts/bootstrap_models.py` against your parquet) before the
+first `uvicorn` start so `models/baseline_full/` exists. Expose the deploy URL
+to Vercel via `NEXT_PUBLIC_API_BASE`.
+
+### CORS
+
+The backend is pre-wired with `CORSMiddleware`; the allow-list is driven by
+the `HRBS_CORS_ORIGINS` env var (comma-separated). Default is `*` for dev
+convenience — pin to your Vercel origin(s) in production:
+
+```bash
+HRBS_CORS_ORIGINS=https://your-app.vercel.app,https://your-app-pr-42.vercel.app
+```
+
+Setting any non-`*` value automatically enables `allow_credentials=True` so
+cookie-based auth (if added later) works cross-origin.
+
 ## Configuration
 
 All settings have working defaults; override only when deviating from dev.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HRBS_DATABASE_URL` | `sqlite+aiosqlite:///./data/db/live.db` | Async ORM URL |
+| `HRBS_DATABASE_URL` | `sqlite+aiosqlite:///./horseracing.db` | Async ORM URL |
 | `HRBS_MODELS_DIR` | `models/baseline_full` | Where the FastAPI lifespan loads trained artifacts |
 | `HRBS_LOG_LEVEL` | `INFO` | structlog level |
+| `HRBS_CORS_ORIGINS` | `*` | Comma-separated browser origin allow-list |
 | `NEXT_PUBLIC_API_BASE` | `http://localhost:8000` | Frontend → backend base URL |
 | `NEXT_PUBLIC_MOCK_API` | `false` | Set `true` for frontend-only demos |
 
-See `.env.example` for the full list with comments.
+See [`.env.example`](.env.example) (backend) and
+[`frontend/.env.example`](frontend/.env.example) (frontend) for the full list
+with comments.
 
 ## Project layout
 
