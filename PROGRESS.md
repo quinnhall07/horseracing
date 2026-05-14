@@ -7,9 +7,9 @@ Format: newest session at the top.
 
 ## Current State
 
-**Phase:** Phase 5a — EV Engine **COMPLETE** · Phase 5b — Portfolio Optimiser **COMPLETE** · Phase 6 — Frontend **COMPLETE**. All seven documented phases (0-6) are now landed; Master-Reference Layer 7 (feedback/online learning loop) is the next unplanned-but-documented track.
-**Last completed task:** Phase 5b + Phase 6 landed end-to-end on parallel worktree branches and merged into `main`. Phase 5b new module: `app/services/portfolio/optimizer.py` (Rockafellar-Uryasev CVaR LP via `scipy.optimize.linprog(method="highs")` with vectorised Plackett-Luce Gumbel scenarios). PL gained `sample_orderings_vectorised` (Gumbel-Max trick, single-numpy-call PL sampling). Validation script gained `--max-decimal-odds` cap (default 100, drops 99/999 placeholders per ADR-040's flagged data-quality issue) and `--optimize` flag wiring (`evaluate(...)` now returns `(candidates, summary, portfolios)`; behaviour unchanged when not passed). Phase 6 stood up `frontend/` from empty: Next.js 14 App Router, TypeScript strict, Tailwind, Recharts, full schema-to-TS type mirror, three pages (upload / card viewer / portfolio ticket), eight components, mock-mode for backend-less demo. ADR-041 documents the CVaR LP packing + per-race scope + 1000-scenario default. **557 tests passing** (was 541 in the non-API suite → +16: 10 optimizer + 6 PL sampler). Frontend `npm run build` ✅ (4 routes, zero TS/ESLint errors).
-**Next task:** Phase 7 — feedback / online-learning loop (Master Reference §179-187): outcome logging → calibration drift CUSUM (already partially built in `app/services/calibration/drift.py`) → rolling sub-model retraining → portfolio-level drift detection. Or: backend `/api/v1/cards/{id}` + `/api/v1/portfolio/{id}` endpoints so the frontend can leave MOCK mode.
+**Phase:** Phases 0-6 **COMPLETE** · Master Reference Layer 7 (feedback / online learning) **COMPLETE** · Cards + Portfolio API endpoints **LIVE** (frontend can leave MOCK mode).
+**Last completed task:** Three parallel worktree streams (A/B/C) merged into `main` in a single integration pass. **Stream A** built `app/services/inference/pipeline.py` (RaceCard → calibrated win probs → EV candidates → interim portfolio) plus `GET /api/v1/cards/{id}` (hydrates `model_prob`/`market_prob`/`edge` on each `HorseEntry`) and `GET /api/v1/portfolio/{id}` (aggregates per-race Portfolios into one card-level Portfolio). Lifespan-loads `InferenceArtifacts` from `models/baseline_full/`; missing-models case returns 503. Card persistence via existing live ingestion DB. **Stream B** added `RaceOutcome` and `BetSettlement` ORM tables (idempotent on `race_dedup_key`), `app/services/feedback/{outcomes,portfolio_drift}.py` with a two-sided CUSUM (k=0.5, h=4 — same defaults as Phase 4 calibration drift, ADR-036). **Stream C** added `scripts/rolling_retrain.py` (3-year half-open window default, drift-triggered via `--skip-if-no-drift` reading a JSON marker, standalone-script execution per CLAUDE.md §11) + `save_drift_state` / `load_drift_state` helpers on `app/services/calibration/drift.py`. **ADRs 042, 043, 044** appended. **623 tests passing** (was 557 → +66: 13 inference + 21 outcomes + 22 portfolio drift + 10 rolling retrain). The 10 new API endpoint tests also pass (`pytest tests/test_api/test_cards.py tests/test_api/test_portfolio.py`). Frontend build remains clean.
+**Next task:** Carry-forward items (see "Open follow-ups" below) — most material: swap the interim portfolio constructor in `app/services/inference/pipeline.py::build_portfolio_from_candidates` for the Phase 5b Rockafellar-Uryasev LP `optimize_portfolio` (one-line replacement; interface matches). Then point the frontend at the running API by setting `NEXT_PUBLIC_MOCK_API=false`.
 
 ### Phase 5a smoke result — flagged for Phase 5b investigation
 
@@ -101,6 +101,93 @@ JP carries 1.6M rows with no speed figure. Either derive a synthetic speed figur
 ---
 
 ## Session Log
+
+### Session: 2026-05-13 (e) — Streams A/B/C: inference API + outcomes/drift + rolling retrain (3 parallel worktree agents)
+
+**Completed:**
+
+Three independent worktree agents dispatched in parallel and merged sequentially into `main`. None of the three branches saw each other or saw the Phase 5b/6 merges — each branched from `d425b30`, the post-Phase-5a merge commit — so each ADR landed at "ADR-041" in its own branch and had to be re-numbered during integration. The integration kept all three.
+
+*Stream A — `worktree-agent-a8e9a98f0b57f6f38` → ADR-042*
+- `app/services/inference/__init__.py` (29) + `app/services/inference/pipeline.py` (856) — reusable inference module:
+  - `InferenceArtifacts.load(models_dir)` aggregates the five sub-models + meta-learner + meta-calibrator. Tolerant of missing optional sub-models (Speed/Form / Connections / Market → 0.5 per ADR-026); strict on meta-learner + meta-calibrator (load-bearing).
+  - `build_inference_features(card)` synthesises the trained-model column schema (`ewm_speed_prior`, `last_speed_prior`, `n_prior_starts`, field-relative normalisation, categoricals) directly from `HorseEntry.pp_lines`. No `groupby.shift(1)` needed (PP lines already exclude today's race).
+  - `infer_calibrated_win_probs(...)` reproduces `_score_test_slice` from the validation script.
+  - `analyze_card(...)` end-to-end orchestrator. Live mode emits WIN candidates only (per ADR-040 — exotic per-permutation odds unavailable pre-race). Decimal odds from `morning_line_odds`, capped at `max_decimal_odds=100.0`.
+  - `build_portfolio_from_candidates(...)` — **interim CVaR-scaled portfolio constructor**. Scales 1/4-Kelly fractions by `k ∈ (0, 1]` until MC-CVaR ≤ `max_drawdown_pct × bankroll`. Phase 5b's R-U LP (`app/services/portfolio/optimizer.optimize_portfolio`) is now in main but Stream A was authored against the pre-5b base; the swap is a one-line follow-up.
+- `app/api/v1/cards.py` (169) + `app/api/v1/portfolio.py` (189) — two GET endpoints, registered via `app/main.py` lifespan (loads `InferenceArtifacts` from `HRBS_MODELS_DIR` env override or `models/baseline_full/`; missing dir → endpoints respond 503). Per-card calibrated vectors memoised in `app.state.inference_cache` (process-local). Multi-race portfolio aggregation in `/portfolio` concatenates `recommendations`, sums `expected_return` and `total_stake_fraction` (capped at 1.0), takes MAX of per-race VaR/CVaR (conservative).
+- `app/db/persistence.py` (+175) — `load_card(session, card_id)` rebuilds Pydantic `RaceCard` from ORM tree via `selectinload` eager joins.
+- `app/api/v1/ingest.py` (+3) — sets `result.card_id` from DB PK so the frontend can roundtrip.
+- `app/schemas/race.py` (+11) — `HorseEntry.{model_prob,market_prob,edge}` optional + `IngestionResult.card_id` optional.
+- Tests: `tests/test_inference/test_pipeline.py` (13 unit tests) + `tests/test_api/test_cards.py` (5) + `tests/test_api/test_portfolio.py` (5).
+
+*Stream B — `worktree-agent-a7a735541d7f27c95` → ADR-043*
+- `app/db/models.py` (+82) — two new ORM tables:
+  - `RaceOutcome`: idempotency anchor `race_dedup_key` (UniqueConstraint, matches Phase 0 SHA-256 dedup convention). Fields: `race_id`, `race_dedup_key`, `finishing_order` JSON, `winning_horse_program_number`, `place_horses` JSON (padded with -1 sentinel for short fields), `payouts` JSON, `settled_at`, `source`.
+  - `BetSettlement`: one row per settled `BetRecommendation`. Captures BOTH recommendation-time and settlement-time decimal odds so future drift attribution can split "model error" vs. "market move". `bet_recommendation_id` is a nullable FK slot — retrofit non-null when a `BetRecommendation` table lands.
+- `app/services/feedback/__init__.py` + `outcomes.py` (310) + `portfolio_drift.py` (252):
+  - `log_race_outcome(...)` idempotent on `race_dedup_key` (returns existing row on dup, INFO-logs; does NOT overwrite payouts).
+  - `settle_bets(...)` handles WIN/EXACTA/TRIFECTA/SUPERFECTA via positional prefix-match on `finishing_order`. Rejects PLACE/SHOW/PICK-n per ADR-039.
+  - `get_settled_pnl_series(...)` returns a time-ordered DataFrame with columns `[settled_at, race_id, bet_type, expected_value, pnl, payout, stake, model_prob, decimal_odds_at_recommendation, won]`.
+  - `portfolio_pnl_zscore`: Bernoulli closed-form σ = `stake · √(p(1−p)) · odds_at_settlement` when probs+odds supplied, else fallback to `|stake|`. Z-clip at ±5, eps-floor 1e-6.
+  - `PortfolioDriftDetector`: two-sided CUSUM, defaults k=0.5 / h=4 (same as ADR-036; ARL₀ ≈ 168). Latches on first trigger. Supports incremental `.update(z)` and batch `.run(z_array)`.
+- Tests: `tests/test_feedback/test_outcomes.py` (21) + `tests/test_feedback/test_portfolio_drift.py` (22). 43 new total.
+
+*Stream C — `worktree-agent-a97bbbfa0128c7b25` → ADR-044*
+- `scripts/rolling_retrain.py` (534) — standalone CLI mirroring `bootstrap_models.py` but windowed:
+  - Slices `[as_of_date − window_years, as_of_date)` from parquet (half-open; rows on `as_of_date` excluded).
+  - Reuses `validate_calibration._three_way_split` for 60/20/20 train/calib/test cut.
+  - Refits requested sub-models + meta-learner + calibrator, writes `report.json` and all artifacts under `models/rolling/<as_of_date>/`.
+  - `--skip-if-no-drift` reads `drift_state.json`; exits code 2 when `triggered=false` (cron no-op), code 0 on successful retrain.
+  - `--sub-models` partial flag lets untrained sub-models fall through to ADR-026's constant-0.5 stubs.
+- `app/services/calibration/drift.py` (+94) — `save_drift_state(detector, path)` + `load_drift_state(path)`. Idempotent file write, parent-dir creation, neutral-state return for missing/corrupt files (cron-safe — never raises).
+- Tests: `tests/test_scripts/test_rolling_retrain.py` (10) — window slicing, time-ordered split, `--skip-if-no-drift` in both directions (subprocess), `report.json` schema, partial-sub-models resilience.
+
+**Key decisions made (new ADRs):**
+- **ADR-042:** Server-side inference pipeline as a reusable module + GET (not POST) endpoints + in-memory per-card cache (vs DB persistence — calibration / retraining decouples model lifecycle from card lifecycle) + multi-race portfolio aggregation rule (concat recs, max VaR/CVaR) + interim portfolio constructor placeholder for Phase 5b's R-U LP.
+- **ADR-043:** Outcomes schema with `race_dedup_key` idempotency + two-sided CUSUM (k=0.5/h=4 matches ADR-036, one mental model across drift detectors) + PnL convention `pnl = payout − stake` + settlement scope = ADR-039 (WIN/EXACTA/TRIFECTA/SUPERFECTA only).
+- **ADR-044:** 3-year rolling window default rationale (two full racing seasons + buffer + drops pre-COVID economics) + drift-triggered default with scheduled-cadence fallback + standalone-script execution rationale (CLAUDE.md §11) + `models/rolling/<as_of_date>/` output layout.
+
+**Surprising / non-obvious findings:**
+
+- **All three agents branched from the same pre-Phase-5b/6 commit (`d425b30`)** because that was main when the worktrees were created. Their DECISIONS.md ADRs all collided at "next-available number" = 041. Integration kept all three and re-tagged Stream A → 042, Stream B → 043, Stream C → 044. Lesson: when dispatching multiple worktree agents that all append to a shared sequenced file, pre-assign the slot numbers in the agent briefs (which we did — but Stream A's prompt expected `ADR-042` and built against a base where the previous ADR was `ADR-040`, so the agent's branch had `ADR-040 → ADR-042` and the merge needed to splice `ADR-041` between them).
+
+- **Stream A built a placeholder portfolio constructor (`build_portfolio_from_candidates`) without seeing the Phase 5b LP**. The interim does scalar scaling on 1/4-Kelly fractions until MC-CVaR clears the threshold. It works (and the API returns sensible Portfolios) but it does NOT solve the Rockafellar-Uryasev LP. The swap-in is a single-line edit in `analyze_card` once we choose to do it; tests will still pass because the interface (`list[BetCandidate] → Portfolio`) is identical.
+
+- **Stream B's CUSUM uses identical thresholds to Stream A-vintage calibration drift (k=0.5, h=4)** so the operator has ONE mental model across every drift detector in the system. The Bernoulli σ derivation is single-event; correlated baskets (e.g. exotic permutations on the same race) will eventually need a copula-derived σ — flagged in ADR-043 but explicitly out of Layer 7 scope.
+
+- **Stream C's `--skip-if-no-drift` exit code 2 is a deliberate cron signal**, not a failure. Cron jobs can branch on it: "if exit==2 then no-op; if exit==0 then retrain proceeded; if exit==1 then bug." The JSON marker schema written by `save_drift_state` is precisely what `load_drift_state` consumes — no version drift between Stream B's CUSUM writes and Stream C's reads (Stream B's `PortfolioDriftDetector` doesn't directly serialise; the existing calibration `ChangePointDetector` does, and the Layer 7 picture is that the calibration drift detector is the live monitor whose marker file Stream C reads).
+
+- **`models/baseline_full/` is gitignored** so the API endpoints respond 503 in a clean clone. Tests bypass this via `app.state.artifacts` injection — endpoint tests use mocked artifacts. The 503 path is the correct degenerate behaviour; the operator must train models (or copy them from an existing artifact dir) before the endpoints serve real data.
+
+**Tests Status:**
+- Pre-Streams baseline (non-API): 557 passing.
+- Stream A adds 13 non-API tests (inference pipeline) + 10 API tests (cards + portfolio).
+- Stream B adds 43 non-API tests (outcomes + drift).
+- Stream C adds 10 non-API tests (rolling retrain).
+- **Post-merge:** 623 non-API tests passing (`pytest tests/ --ignore=tests/test_api -q`) + 10 new API tests passing (`pytest tests/test_api/test_cards.py tests/test_api/test_portfolio.py`). Total verified: 633.
+- The 6 pre-existing `tests/test_api/test_ingest.py` errors are environmental (py3.14 + sqlalchemy greenlet missing) — not regressions, untouched.
+
+**Frontend status:**
+- `frontend/npm run build` ✅ still clean (4 routes, zero TS/ESLint errors). Untouched by these streams; ready to point at the now-live API by flipping `NEXT_PUBLIC_MOCK_API=false`.
+
+**Open follow-ups:**
+
+1. **Swap Stream A's `build_portfolio_from_candidates` for Phase 5b's `optimize_portfolio`.** Stream A's interim is a scalar-scaling placeholder; the R-U LP is the canonical choice. One-line edit inside `analyze_card`. Both produce `Portfolio`; no test churn expected.
+2. **`BetSettlement.bet_recommendation_id` FK retrofit** when a `BetRecommendation` table is added (Stream B left the slot nullable).
+3. **Pace / Sequence rolling-retrain unblock** when the fractional-time export columns land (ADR-026) and the PyTorch + globally-unique `horse_id` is wired. Stream C's `is_trainable_with` gate is already in place — flipping these on is no-touch to the orchestrator.
+4. **Empirical window-length sweep** (2y / 3y / 4y) against Stream B's outcomes log once live data accumulates (ADR-044 "When to revisit").
+5. **Frontend hookup** — set `NEXT_PUBLIC_MOCK_API=false` and `NEXT_PUBLIC_API_BASE` to the running FastAPI host. Mock-mode remains the fallback for demoing without a backend.
+6. **Re-export the training parquet** (Phase 0 concern). The real-data Phase 5b smoke and a real-data Stream C rolling-retrain are gated on `data/exports/training_20260512.parquet` regeneration.
+
+**Commits on main since previous "Current State":**
+- `b469b0a` Merge Stream A — inference pipeline + cards/portfolio API endpoints
+- `f77f945` Merge Stream B — outcomes logging + portfolio drift CUSUM
+- `c81bd26` Merge Stream C — rolling-window retraining script
+
+Each merge required a DECISIONS.md conflict resolution (ADR ordering) — no other file conflicts across the three streams.
+
+---
 
 ### Session: 2026-05-13 (c) — Phase 5b portfolio optimiser (parallel-worktree agent)
 
