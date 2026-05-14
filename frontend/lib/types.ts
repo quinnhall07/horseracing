@@ -243,3 +243,25 @@ export interface Portfolio {
   cvar_95: number;
   total_stake_fraction: number;
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// ParetoPoint / ParetoFrontier
+// ────────────────────────────────────────────────────────────────────────────
+//
+// The /pareto endpoint returns 6 (configurable) full Portfolio objects, each
+// solved at a different CVaR drawdown cap. Frontend uses this to render a
+// risk/return curve the user can scrub along — no extra round-trips per stop.
+
+export interface ParetoPoint {
+  /** Per-card CVaR drawdown cap used to solve this Portfolio (e.g. 0.05). */
+  max_drawdown_pct: number;
+  portfolio: Portfolio;
+}
+
+export interface ParetoFrontier {
+  card_id: string;
+  bankroll: number;
+  /** Pre-filter candidate count fed into each LP solve. */
+  n_candidates_total: number;
+  frontier: ParetoPoint[];
+}

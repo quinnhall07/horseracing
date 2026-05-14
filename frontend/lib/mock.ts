@@ -14,8 +14,12 @@
  */
 
 import type {
+  BetRecommendation,
+  BetType,
   HorseEntry,
   IngestionResult,
+  ParetoFrontier,
+  ParetoPoint,
   PastPerformanceLine,
   Portfolio,
   RaceCard,
@@ -377,4 +381,175 @@ export function mockCard(id?: string): RaceCard {
 export function mockPortfolio(id?: string): Portfolio {
   if (!id || id === MOCK_PORTFOLIO.card_id) return MOCK_PORTFOLIO;
   return { ...MOCK_PORTFOLIO, card_id: id };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Pareto frontier: 6 portfolios, monotone in (risk, return).
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Picks are layered: low-risk levels keep only the highest-edge WIN bets,
+// higher-risk levels progressively add exotics. Stakes scale with risk so
+// expected return rises with cvar_95. Numbers are hand-tuned to look like
+// the kind of curve the real CVaR LP produces (concave, increasing).
+
+interface ParetoPick {
+  raceIdx: number;
+  type: BetType;
+  selection: number[];
+  stakeFrac: number;
+}
+
+const PARETO_PICK_LAYERS: ParetoPick[][] = [
+  // Layer 0 — conservative WIN-only base (used at every risk level).
+  [
+    { raceIdx: 0, type: "win", selection: [1], stakeFrac: 0.012 },
+    { raceIdx: 2, type: "win", selection: [1], stakeFrac: 0.010 },
+  ],
+  // Layer 1 — add another WIN and a small exacta.
+  [
+    { raceIdx: 5, type: "win", selection: [2], stakeFrac: 0.014 },
+    { raceIdx: 3, type: "exacta", selection: [1, 2], stakeFrac: 0.006 },
+  ],
+  // Layer 2 — bump WIN stakes + add a trifecta.
+  [
+    { raceIdx: 4, type: "trifecta", selection: [1, 2, 3], stakeFrac: 0.008 },
+    { raceIdx: 6, type: "win", selection: [1], stakeFrac: 0.016 },
+  ],
+  // Layer 3 — a superfecta swing and one more WIN.
+  [
+    { raceIdx: 7, type: "superfecta", selection: [1, 2, 3, 4], stakeFrac: 0.006 },
+    { raceIdx: 1, type: "win", selection: [2], stakeFrac: 0.018 },
+  ],
+  // Layer 4 — top off with an exacta + win.
+  [
+    { raceIdx: 8, type: "exacta", selection: [1, 3], stakeFrac: 0.010 },
+    { raceIdx: 4, type: "win", selection: [1], stakeFrac: 0.022 },
+  ],
+];
+
+function buildRecommendation(
+  card: RaceCard,
+  pick: ParetoPick,
+  stakeMultiplier: number,
+  bankroll: number,
+): BetRecommendation {
+  const race = card.races[pick.raceIdx];
+  if (!race) throw new Error(`mock: missing race ${pick.raceIdx}`);
+  const topHorse = race.entries[(pick.selection[0] ?? 1) - 1];
+  const modelProb = topHorse?.model_prob ?? 0.2;
+  const marketProb = topHorse?.market_prob ?? 0.18;
+  const decimalOdds = topHorse?.morning_line_odds ?? 5.0;
+  const legs = pick.selection.length;
+  const adjModel = Math.pow(modelProb, legs);
+  const adjMarket = Math.pow(marketProb, legs);
+  const adjOdds = Math.pow(decimalOdds, legs);
+  const edge = adjModel - adjMarket;
+  const ev = adjModel * adjOdds - 1;
+  const scaledFrac = Math.min(0.03, pick.stakeFrac * stakeMultiplier);
+  return {
+    candidate: {
+      race_id: `r${race.header.race_number}`,
+      bet_type: pick.type,
+      selection: pick.selection,
+      model_prob: Number(adjModel.toFixed(5)),
+      decimal_odds: Number(adjOdds.toFixed(2)),
+      market_prob: Number(adjMarket.toFixed(5)),
+      edge: Number(edge.toFixed(4)),
+      expected_value: Number(ev.toFixed(4)),
+      kelly_fraction: Number((scaledFrac * 4).toFixed(4)),
+      market_impact_applied: legs > 1,
+      pool_size: legs > 1 ? 250_000 : null,
+    },
+    stake: Number((scaledFrac * bankroll).toFixed(2)),
+    stake_fraction: scaledFrac,
+  };
+}
+
+function buildPortfolioAtRisk(
+  card: RaceCard,
+  cardId: string,
+  bankroll: number,
+  riskIdx: number,
+  riskLevel: number,
+): Portfolio {
+  // riskIdx ∈ [0..5] picks how many layers are active.
+  // Layer 0 is always included; each additional layer unlocks more bets and
+  // a larger stake multiplier on existing picks.
+  const layersToInclude = Math.min(riskIdx + 1, PARETO_PICK_LAYERS.length);
+  const stakeMultiplier = 0.8 + riskIdx * 0.35; // 0.80, 1.15, 1.50, 1.85, 2.20, 2.55
+
+  const recs: BetRecommendation[] = [];
+  for (let i = 0; i < layersToInclude; i += 1) {
+    const layer = PARETO_PICK_LAYERS[i];
+    if (!layer) continue;
+    for (const pick of layer) {
+      recs.push(buildRecommendation(card, pick, stakeMultiplier, bankroll));
+    }
+  }
+
+  const totalStakeFrac = recs.reduce((a, r) => a + r.stake_fraction, 0);
+  const expectedReturn = recs.reduce(
+    (a, r) => a + r.stake * r.candidate.expected_value,
+    0,
+  );
+  // CVaR scales roughly with stake + an exotic risk premium. We tune so that
+  // at risk_level=0.05 we land near ~$500 downside, and at 0.30 we land near
+  // ~$3000 — matching the spec.
+  const cvar = -(riskLevel * bankroll * (1 + 0.04 * riskIdx));
+  const v95 = cvar * 0.45;
+
+  return {
+    card_id: cardId,
+    bankroll,
+    recommendations: recs,
+    expected_return: Number(expectedReturn.toFixed(2)),
+    var_95: Number(v95.toFixed(2)),
+    cvar_95: Number(cvar.toFixed(2)),
+    total_stake_fraction: Number(totalStakeFrac.toFixed(4)),
+  };
+}
+
+const DEFAULT_RISK_LEVELS = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3];
+
+export function mockParetoFrontier(
+  cardId?: string,
+  options?: {
+    bankroll?: number;
+    riskLevels?: number[];
+  },
+): ParetoFrontier {
+  const id = cardId ?? MOCK_CARD.card_id ?? "mock-cd-2026-05-10";
+  const bankroll = options?.bankroll ?? BANKROLL;
+  const riskLevels = options?.riskLevels?.length
+    ? [...options.riskLevels]
+    : DEFAULT_RISK_LEVELS;
+  // Card is the seeded mock — same set of races regardless of id.
+  const card = MOCK_CARD;
+
+  // Build raw points, then enforce monotone non-decreasing expected_return
+  // along the frontier (the LP would do this naturally; we coerce here so the
+  // mock can't accidentally violate the invariant if the layer tuning shifts).
+  const raw: ParetoPoint[] = riskLevels.map((rl, idx) => {
+    const portfolio = buildPortfolioAtRisk(card, id, bankroll, idx, rl);
+    return { max_drawdown_pct: rl, portfolio };
+  });
+  for (let i = 1; i < raw.length; i += 1) {
+    const prev = raw[i - 1];
+    const cur = raw[i];
+    if (!prev || !cur) continue;
+    if (cur.portfolio.expected_return < prev.portfolio.expected_return) {
+      // Lift by 1c so the curve never dips.
+      cur.portfolio.expected_return = Number(
+        (prev.portfolio.expected_return + 0.01).toFixed(2),
+      );
+    }
+  }
+
+  const nCandidates = 47; // hand-picked, matches the example in the spec
+  return {
+    card_id: id,
+    bankroll,
+    n_candidates_total: nCandidates,
+    frontier: raw,
+  };
 }

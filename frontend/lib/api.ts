@@ -15,8 +15,18 @@
  *   GET  /api/v1/portfolio/{card_id} → Portfolio                      ⛔ todo
  */
 
-import type { IngestionResult, Portfolio, RaceCard } from "./types";
-import { mockCard, mockIngestionResult, mockPortfolio } from "./mock";
+import type {
+  IngestionResult,
+  ParetoFrontier,
+  Portfolio,
+  RaceCard,
+} from "./types";
+import {
+  mockCard,
+  mockIngestionResult,
+  mockParetoFrontier,
+  mockPortfolio,
+} from "./mock";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 const MOCK = process.env.NEXT_PUBLIC_MOCK_API === "true";
@@ -84,6 +94,49 @@ export async function getPortfolio(id: string): Promise<Portfolio> {
     { headers: { Accept: "application/json" } },
   );
   return jsonOrThrow<Portfolio>(res);
+}
+
+export interface ParetoFrontierOptions {
+  bankroll?: number;
+  minEdge?: number;
+  maxDecimalOdds?: number;
+  cvarAlpha?: number;
+  nScenarios?: number;
+  seed?: number;
+  riskLevels?: number[];
+}
+
+/**
+ * GET /api/v1/portfolio/{card_id}/pareto
+ *
+ * Returns the full risk/return frontier — one Portfolio per risk level. The
+ * frontend renders the curve and lets the user slide along it without
+ * additional round-trips. Query parameters mirror the optimiser knobs that
+ * Stream X exposes.
+ */
+export async function getParetoFrontier(
+  cardId: string,
+  options?: ParetoFrontierOptions,
+): Promise<ParetoFrontier> {
+  if (MOCK) return mockDelay(mockParetoFrontier(cardId, options), 700);
+
+  const params = new URLSearchParams();
+  if (options?.bankroll != null) params.set("bankroll", String(options.bankroll));
+  if (options?.minEdge != null) params.set("min_edge", String(options.minEdge));
+  if (options?.maxDecimalOdds != null)
+    params.set("max_decimal_odds", String(options.maxDecimalOdds));
+  if (options?.cvarAlpha != null) params.set("cvar_alpha", String(options.cvarAlpha));
+  if (options?.nScenarios != null) params.set("n_scenarios", String(options.nScenarios));
+  if (options?.seed != null) params.set("seed", String(options.seed));
+  if (options?.riskLevels?.length)
+    params.set("risk_levels", options.riskLevels.join(","));
+
+  const qs = params.toString();
+  const url = `${API_BASE}/api/v1/portfolio/${encodeURIComponent(cardId)}/pareto${
+    qs ? `?${qs}` : ""
+  }`;
+  const res = await fetch(url, { headers: { Accept: "application/json" } });
+  return jsonOrThrow<ParetoFrontier>(res);
 }
 
 export const apiConfig = { API_BASE, MOCK } as const;
