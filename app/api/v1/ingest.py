@@ -66,10 +66,12 @@ async def upload_card(
 
     if result.success and result.card is not None:
         try:
-            card_id = await persist_ingestion_result(session, result)
+            card_pk = await persist_ingestion_result(session, result)
+            if card_pk is not None:
+                result.card_id = str(card_pk)
             log.info(
                 "ingest.persisted",
-                card_id=card_id,
+                card_id=result.card_id,
                 filename=file.filename,
                 races=result.card.n_races,
             )

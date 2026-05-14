@@ -224,6 +224,14 @@ class HorseEntry(BaseModel):
     days_since_last: Optional[int] = None        # days from most recent PP to race_date
     class_trajectory: Optional[float] = None     # normalized claiming price delta
 
+    # ── Inference-time hydration (Stream A) ───────────────────────────────────
+    # Populated by `GET /api/v1/cards/{id}` AFTER the inference pipeline runs.
+    # None at parse time; filled in only on the hydrated response, never
+    # persisted to the ingestion DB.
+    model_prob: Optional[float] = None    # calibrated P(win) from meta-learner
+    market_prob: Optional[float] = None   # 1 / morning_line_odds (or live tote)
+    edge: Optional[float] = None          # model_prob - market_prob
+
     @model_validator(mode="after")
     def _compute_ml_implied_prob(self) -> "HorseEntry":
         if self.morning_line_odds is not None and self.ml_implied_prob is None:
@@ -387,12 +395,15 @@ class IngestionResult(BaseModel):
 
     success          — True if at least one race was parseable
     card             — the fully structured race card (None if total parse failure)
+    card_id          — DB primary key of the persisted card (Stream A); None
+                       when persistence didn't run (e.g. failed parse)
     errors           — critical errors that prevented parsing
     processing_ms    — wall-clock parsing time in milliseconds
     """
 
     success: bool
     card: Optional[RaceCard] = None
+    card_id: Optional[str] = None
     errors: list[str] = Field(default_factory=list)
     processing_ms: Optional[float] = None
 
